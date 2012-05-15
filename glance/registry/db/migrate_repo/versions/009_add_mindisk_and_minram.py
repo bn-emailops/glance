@@ -47,7 +47,11 @@ def get_images_table(meta):
         Column('min_disk', Integer(), default=0),
         Column('min_ram', Integer(), default=0),
         mysql_engine='InnoDB',
+<<<<<<< HEAD
         useexisting=True)
+=======
+        extend_existing=True)
+>>>>>>> upstream/master
 
     return images
 

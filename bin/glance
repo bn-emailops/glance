@@ -26,9 +26,10 @@ import functools
 import gettext
 import optparse
 import os
-import re
 import sys
 import time
+
+from urlparse import urlparse
 
 # If ../glance/__init__.py exists, add ../ to Python search path, so that
 # it will override what happens to be installed in /usr/(local/)lib/python...
@@ -41,13 +42,15 @@ if os.path.exists(os.path.join(possible_topdir, 'glance', '__init__.py')):
 gettext.install('glance', unicode=1)
 
 from glance import client as glance_client
-from glance import version
 from glance.common import exception
-from glance.common import utils as common_utils
-from glance import utils
+from glance.common import utils
+from glance import version
+
 
 SUCCESS = 0
 FAILURE = 1
+
+DEFAULT_PORT = 9292
 
 
 #TODO(sirp): make more of the actions use this decorator
@@ -59,10 +62,19 @@ def catch_error(action):
             try:
                 ret = func(*args, **kwargs)
                 return SUCCESS if ret is None else ret
+<<<<<<< HEAD
             except exception.NotAuthorized:
                 print "Not authorized to make this request. Check "\
                       "your credentials (OS_AUTH_USER, OS_AUTH_KEY, ...)."
                 return FAILURE
+=======
+            except exception.Forbidden:
+                print "Not authorized to make this request. Check "\
+                      "your credentials (OS_AUTH_USER, OS_AUTH_KEY, ...)."
+                return FAILURE
+            except exception.ClientConfigurationError:
+                raise
+>>>>>>> upstream/master
             except Exception, e:
                 options = args[0]
                 if options.debug:
@@ -75,15 +87,6 @@ def catch_error(action):
 
         return wrapper
     return wrap
-
-
-def get_percent_done(image):
-    try:
-        pct_done = image['size'] * 100 / int(image['expected_size'])
-    except (ValueError, ZeroDivisionError):
-        # NOTE(sirp): Ignore if expected_size isn't a number, or if it's 0
-        pct_done = "UNKNOWN"
-    return pct_done
 
 
 def get_image_fields_from_args(args):
@@ -100,8 +103,6 @@ def get_image_fields_from_args(args):
             raise RuntimeError(msg)
         fields[pieces[0]] = pieces[1]
 
-    fields = dict([(k.lower().replace('-', '_'), v)
-                   for k, v in fields.items()])
     return fields
 
 
@@ -114,7 +115,12 @@ def get_image_filters_from_args(args):
         return FAILURE
 
     SUPPORTED_FILTERS = ['name', 'disk_format', 'container_format', 'status',
+<<<<<<< HEAD
                          'min_ram', 'min_disk', 'size_min', 'size_max']
+=======
+                         'min_ram', 'min_disk', 'size_min', 'size_max',
+                         'changes-since']
+>>>>>>> upstream/master
     filters = {}
     for (key, value) in fields.items():
         if key not in SUPPORTED_FILTERS:
@@ -138,6 +144,7 @@ def print_image_formatted(client, image):
                                       image['id'])
     print "Id: %s" % image['id']
     print "Public: " + (image['is_public'] and "Yes" or "No")
+    print "Protected: " + (image['protected'] and "Yes" or "No")
     print "Name: %s" % image['name']
     print "Status: %s" % image['status']
     print "Size: %d" % int(image['size'])
@@ -145,7 +152,11 @@ def print_image_formatted(client, image):
     print "Container format: %s" % image['container_format']
     print "Minimum Ram Required (MB): %s" % image['min_ram']
     print "Minimum Disk Required (GB): %s" % image['min_disk']
+<<<<<<< HEAD
     if image['owner']:
+=======
+    if image.get('owner'):
+>>>>>>> upstream/master
         print "Owner: %s" % image['owner']
     if len(image['properties']) > 0:
         for k, v in image['properties'].items():
@@ -168,25 +179,38 @@ Field names of note:
 
 id                  Optional. If not specified, an image identifier will be
                     automatically assigned.
-name                Required. A name for the image.
+name                Optional. A name for the image.
 size                Optional. Should be size in bytes of the image if
                     specified.
 is_public           Optional. If specified, interpreted as a boolean value
                     and sets or unsets the image's availability to the public.
                     The default value is False.
-disk_format         Optional. Possible values are 'vhd','vmdk','raw', 'qcow2',
-                    and 'ami'. Default value is 'raw'.
-container_format    Optional. Possible values are 'ovf' and 'ami'.
-                    Default value is 'ovf'.
+protected           Optional. If specified, interpreted as a boolean value
+                    and enables or disables deletion protection.
+                    The default value is False.
+disk_format         Required. If unspecified and container_format is specified
+                    as 'ami', 'ari' or 'aki', disk_format will default to the
+                    container_format value. Possible values are 'ami', 'ari',
+                    'aki', 'vhd', 'vmk', 'raw', 'qcow2' and 'vdi'.
+container_format    Required. If unspecified and disk_format is specified as
+                    'ami', 'ari' or 'aki', container_format will default to the
+                    disk_format value. Possible values are 'ami', 'ari', 'aki',
+                    'bare' and 'ovf'.
 location            Optional. When specified, should be a readable location
                     in the form of a URI: $STORE://LOCATION. For example, if
                     the image data is stored in a file on the local
                     filesystem at /usr/share/images/some.image.tar.gz
                     you would specify:
                     location=file:///usr/share/images/some.image.tar.gz
+copy_from           Optional. An external location (HTTP, S3 or Swift URI) to
+                    copy image content from. For example, if the image data is
+                    stored as an object called fedora16 in an S3 bucket named
+                    images, you would specify (with the approriate access and
+                    secret keys):
+                    copy_from=s3://akey:skey@s3.amazonaws.com/images/fedora16
 
 Any other field names are considered to be custom properties so be careful
-to spell field names correctly. :)
+to spell field names correctly.
 
 STREAMING IMAGE DATA
 ===============================================================================
@@ -203,7 +227,8 @@ EXAMPLES
     location=http://images.ubuntu.org/images/lucid-10.04-i686.iso \\
     distro="Ubuntu 10.04 LTS"
 
-%(prog)s add name="My Image" distro="Ubuntu 10.04 LTS" < /tmp/myimage.iso"""
+%(prog)s add name="My Image" disk_format=raw container_format=ovf \\
+    distro="Ubuntu 10.04 LTS" < /tmp/myimage.iso"""
     c = get_client(options)
 
     try:
@@ -212,17 +237,26 @@ EXAMPLES
         print e
         return FAILURE
 
-    if 'name' not in fields.keys():
-        print "Please specify a name for the image using name=VALUE"
-        return FAILURE
-
-    image_meta = {'name': fields.pop('name'),
-                  'is_public': common_utils.bool_from_string(
+    image_meta = {'id': fields.pop('id', None),
+                  'name': fields.pop('name', None),
+                  'is_public': utils.bool_from_string(
                       fields.pop('is_public', False)),
+<<<<<<< HEAD
                   'disk_format': fields.pop('disk_format', 'raw'),
                   'min_disk': fields.pop('min_disk', 0),
                   'min_ram': fields.pop('min_ram', 0),
                   'container_format': fields.pop('container_format', 'ovf')}
+=======
+                  'protected': utils.bool_from_string(
+                      fields.pop('protected', False)),
+                  'min_disk': fields.pop('min_disk', 0),
+                  'min_ram': fields.pop('min_ram', 0),
+    }
+
+    for format in ['disk_format', 'container_format']:
+        if format in fields:
+            image_meta[format] = fields.pop(format)
+>>>>>>> upstream/master
 
     # Strip any args that are not supported
     unsupported_fields = ['status', 'size']
@@ -231,23 +265,41 @@ EXAMPLES
             print 'Found non-settable field %s. Removing.' % field
             fields.pop(field)
 
-    if 'location' in fields.keys():
-        image_meta['location'] = fields.pop('location')
+    def _external_source(fields, image_data):
+        source = None
+        features = {}
+        if 'location' in fields.keys():
+            source = fields.pop('location')
+            image_meta['location'] = source
+            if 'checksum' in fields.keys():
+                image_meta['checksum'] = fields.pop('checksum')
+        elif 'copy_from' in fields.keys():
+            source = fields.pop('copy_from')
+            features['x-glance-api-copy-from'] = source
+        return source, features
 
     # We need either a location or image data/stream to add...
-    image_location = image_meta.get('location')
+    location, features = _external_source(fields, image_meta)
     image_data = None
-    if not image_location:
+    if not location:
         # Grab the image data stream from stdin or redirect,
         # otherwise error out
         image_data = sys.stdin
+<<<<<<< HEAD
+=======
+
+    # allow owner to be set when image is created
+    if 'owner' in fields.keys():
+        image_meta['owner'] = fields.pop('owner')
+>>>>>>> upstream/master
 
     # Add custom attributes, which are all the arguments remaining
     image_meta['properties'] = fields
 
     if not options.dry_run:
         try:
-            image_meta = c.add_image(image_meta, image_data)
+            image_meta = c.add_image(image_meta, image_data,
+                                     features=features)
             image_id = image_meta['id']
             print "Added new image with ID: %s" % image_id
             if options.verbose:
@@ -274,9 +326,17 @@ EXAMPLES
             return FAILURE
     else:
         print "Dry run. We would have done the following:"
+
+        def _dump(dict):
+            for k, v in sorted(dict.items()):
+                print " %(k)30s => %(v)s" % locals()
+
         print "Add new image with metadata:"
-        for k, v in sorted(image_meta.items()):
-            print " %(k)30s => %(v)s" % locals()
+        _dump(image_meta)
+
+        if features:
+            print "with features enabled:"
+            _dump(features)
 
     return SUCCESS
 
@@ -295,14 +355,18 @@ to Glance that represents the metadata for an image.
 Field names that can be specified:
 
 name                A name for the image.
-location            The location of the image.
+location            An external location to serve out from.
+copy_from           An external location (HTTP, S3 or Swift URI) to copy image
+                    content from.
 is_public           If specified, interpreted as a boolean value
                     and sets or unsets the image's availability to the public.
+protected           If specified, interpreted as a boolean value
+                    and enables or disables deletion protection for the image.
 disk_format         Format of the disk image
 container_format    Format of the container
 
 All other field names are considered to be custom properties so be careful
-to spell field names correctly. :)"""
+to spell field names correctly."""
     c = get_client(options)
     try:
         image_id = args.pop(0)
@@ -327,6 +391,11 @@ to spell field names correctly. :)"""
             print 'Found non-modifiable field %s. Removing.' % field
             fields.pop(field)
 
+    features = {}
+    if 'location' not in fields and 'copy_from' in fields:
+        source = fields.pop('copy_from')
+        features['x-glance-api-copy-from'] = source
+
     base_image_fields = ['disk_format', 'container_format', 'name',
                          'min_disk', 'min_ram', 'location', 'owner']
     for field in base_image_fields:
@@ -336,15 +405,19 @@ to spell field names correctly. :)"""
 
     # Have to handle "boolean" values specially...
     if 'is_public' in fields:
-        image_meta['is_public'] = common_utils.bool_from_string(
+        image_meta['is_public'] = utils.bool_from_string(
             fields.pop('is_public'))
+    if 'protected' in fields:
+        image_meta['protected'] = utils.bool_from_string(
+            fields.pop('protected'))
 
     # Add custom attributes, which are all the arguments remaining
     image_meta['properties'] = fields
 
     if not options.dry_run:
         try:
-            image_meta = c.update_image(image_id, image_meta=image_meta)
+            image_meta = c.update_image(image_id, image_meta=image_meta,
+                                        features=features)
             print "Updated image %s" % image_id
 
             if options.verbose:
@@ -353,6 +426,9 @@ to spell field names correctly. :)"""
         except exception.NotFound:
             print "No image with ID %s was found" % image_id
             return FAILURE
+        except exception.Forbidden:
+            print "You do not have permission to update image %s" % image_id
+            return FAILURE
         except Exception, e:
             print "Failed to update image. Got error:"
             pieces = unicode(e).split('\n')
@@ -360,10 +436,18 @@ to spell field names correctly. :)"""
                 print piece
             return FAILURE
     else:
+        def _dump(dict):
+            for k, v in sorted(dict.items()):
+                print " %(k)30s => %(v)s" % locals()
+
         print "Dry run. We would have done the following:"
         print "Update existing image with metadata:"
-        for k, v in sorted(image_meta.items()):
-            print " %(k)30s => %(v)s" % locals()
+        _dump(image_meta)
+
+        if features:
+            print "with features enabled:"
+            _dump(features)
+
     return SUCCESS
 
 
@@ -392,6 +476,9 @@ Deletes an image from Glance"""
         return SUCCESS
     except exception.NotFound:
         print "No image with ID %s was found" % image_id
+        return FAILURE
+    except exception.Forbidden:
+        print "You do not have permission to delete image %s" % image_id
         return FAILURE
 
 
@@ -442,7 +529,7 @@ def _images_index(client, filters, limit, print_header=False, **kwargs):
         return SUCCESS
 
     pretty_table = utils.PrettyTable()
-    pretty_table.add_column(16, label="ID")
+    pretty_table.add_column(36, label="ID")
     pretty_table.add_column(30, label="Name")
     pretty_table.add_column(20, label="Disk Format")
     pretty_table.add_column(20, label="Container Format")
@@ -458,7 +545,11 @@ def _images_index(client, filters, limit, print_header=False, **kwargs):
                                     image['container_format'],
                                     image['size'])
 
-    if not options.force and len(images) == limit and \
+    # suppress pagination when output is redirected
+    suppress_pagination = (options.force or
+        (getattr(os, 'isatty') and not os.isatty(sys.stdout.fileno())))
+
+    if not suppress_pagination and len(images) == limit and \
        not user_confirm("Fetch next page?", True):
         return SUCCESS
 
@@ -475,8 +566,8 @@ Returns basic information for all public images
 a Glance server knows about. Provided fields are
 handled as query filters. Supported filters
 include 'name', 'disk_format', 'container_format',
-'status', 'size_min', and 'size_max.' Any extra
-fields are treated as image metadata properties"""
+'status', 'size_min', 'size_max' and 'changes-since.'
+Any extra fields are treated as image metadata properties"""
     client = get_client(options)
     filters = get_image_filters_from_args(args)
     limit = options.limit
@@ -534,8 +625,8 @@ Returns detailed information for all public images
 a Glance server knows about. Provided fields are
 handled as query filters. Supported filters
 include 'name', 'disk_format', 'container_format',
-'status', 'size_min', and 'size_max.' Any extra
-fields are treated as image metadata properties"""
+'status', 'size_min', 'size_max' and 'changes-since.'
+Any extra fields are treated as image metadata properties"""
     client = get_client(options)
     filters = get_image_filters_from_args(args)
     limit = options.limit
@@ -576,249 +667,6 @@ Deletes all images from a Glance server"""
             print e
             return FAILURE
     return SUCCESS
-
-
-@catch_error('show cached images')
-def cache_index(options, args):
-    """
-%(prog)s cache-index [options]
-
-List all images currently cached"""
-    client = get_client(options)
-    images = client.get_cached_images()
-    if not images:
-        print "No cached images."
-        return SUCCESS
-
-    print "Found %d cached images..." % len(images)
-
-    pretty_table = utils.PrettyTable()
-    pretty_table.add_column(16, label="ID")
-    pretty_table.add_column(30, label="Name")
-    pretty_table.add_column(19, label="Last Accessed (UTC)")
-    # 1 TB takes 13 characters to display: len(str(2**40)) == 13
-    pretty_table.add_column(14, label="Size", just="r")
-    pretty_table.add_column(10, label="Hits", just="r")
-
-    print pretty_table.make_header()
-
-    for image in images:
-        print pretty_table.make_row(
-            image['id'],
-            image['name'],
-            image['last_accessed'],
-            image['size'],
-            image['hits'])
-
-
-@catch_error('show invalid cache images')
-def cache_invalid(options, args):
-    """
-%(prog)s cache-invalid [options]
-
-List current invalid cache images"""
-    client = get_client(options)
-    images = client.get_invalid_cached_images()
-    if not images:
-        print "No invalid cached images."
-        return SUCCESS
-
-    print "Found %d invalid cached images..." % len(images)
-
-    pretty_table = utils.PrettyTable()
-    pretty_table.add_column(16, label="ID")
-    pretty_table.add_column(30, label="Name")
-    pretty_table.add_column(30, label="Error")
-    pretty_table.add_column(19, label="Last Modified (UTC)")
-    # 1 TB takes 13 characters to display: len(str(2**40)) == 13
-    pretty_table.add_column(14, label="Size", just="r")
-    pretty_table.add_column(14, label="Expected Size", just="r")
-    pretty_table.add_column(7, label="% Done", just="r")
-
-    print pretty_table.make_header()
-
-    for image in images:
-        print pretty_table.make_row(
-            image['id'],
-            image['name'],
-            image['error'],
-            image['last_accessed'],
-            image['size'],
-            image['expected_size'],
-            get_percent_done(image))
-
-
-@catch_error('show incomplete cache images')
-def cache_incomplete(options, args):
-    """
-%(prog)s cache-incomplete [options]
-
-List images currently being fetched"""
-    client = get_client(options)
-    images = client.get_incomplete_cached_images()
-    if not images:
-        print "No incomplete cached images."
-        return SUCCESS
-
-    print "Found %d incomplete cached images..." % len(images)
-
-    pretty_table = utils.PrettyTable()
-    pretty_table.add_column(16, label="ID")
-    pretty_table.add_column(30, label="Name")
-    pretty_table.add_column(19, label="Last Modified (UTC)")
-    # 1 TB takes 13 characters to display: len(str(2**40)) == 13
-    pretty_table.add_column(14, label="Size", just="r")
-    pretty_table.add_column(14, label="Expected Size", just="r")
-    pretty_table.add_column(7, label="% Done", just="r")
-
-    print pretty_table.make_header()
-
-    for image in images:
-        print pretty_table.make_row(
-            image['id'],
-            image['name'],
-            image['last_modified'],
-            image['size'],
-            image['expected_size'],
-            get_percent_done(image))
-
-
-@catch_error('purge the specified cached image')
-def cache_purge(options, args):
-    """
-%(prog)s cache-purge [options]
-
-Purges an image from the cache"""
-    try:
-        image_id = args.pop()
-    except IndexError:
-        print "Please specify the ID of the image you wish to purge "
-        print "from the cache as the first argument"
-        return FAILURE
-
-    if not options.force and \
-       not user_confirm("Purge cached image %s?" % (image_id,), default=False):
-        print 'Not purging cached image %s' % (image_id,)
-        return FAILURE
-
-    client = get_client(options)
-    client.purge_cached_image(image_id)
-
-    if options.verbose:
-        print "done"
-
-
-@catch_error('clear all cached images')
-def cache_clear(options, args):
-    """
-%(prog)s cache-clear [options]
-
-Removes all images from the cache"""
-    if not options.force and \
-       not user_confirm("Clear all cached images?", default=False):
-        print 'Not purging any cached images.'
-        return FAILURE
-
-    client = get_client(options)
-    num_purged = client.clear_cached_images()
-
-    if options.verbose:
-        print "Purged %(num_purged)s cached images" % locals()
-
-
-@catch_error('reap invalid images')
-def cache_reap_invalid(options, args):
-    """
-%(prog)s cache-reap-invalid [options]
-
-Reaps any invalid images that were left for
-debugging purposes"""
-    if not options.force and \
-       not user_confirm("Reap all invalid cached images?", default=False):
-        print 'Not reaping any invalid cached images.'
-        return FAILURE
-
-    client = get_client(options)
-    num_reaped = client.reap_invalid_cached_images()
-
-    if options.verbose:
-        print "Reaped %(num_reaped)s invalid cached images" % locals()
-
-
-@catch_error('reap stalled images')
-def cache_reap_stalled(options, args):
-    """
-%(prog)s cache-reap-stalled [options]
-
-Reaps any stalled incomplete images"""
-    if not options.force and \
-       not user_confirm("Reap all stalled cached images?", default=False):
-        print 'Not reaping any stalled cached images.'
-        return FAILURE
-
-    client = get_client(options)
-    num_reaped = client.reap_stalled_cached_images()
-
-    if options.verbose:
-        print "Reaped %(num_reaped)s stalled cached images" % locals()
-
-
-@catch_error('prefetch the specified cached image')
-def cache_prefetch(options, args):
-    """
-%(prog)s cache-prefetch [options]
-
-Pre-fetch an image or list of images into the cache"""
-    image_ids = args
-    if not image_ids:
-        print "Please specify the ID or a list of image IDs of the images "\
-              "you wish to "
-        print "prefetch from the cache as the first argument"
-        return FAILURE
-
-    client = get_client(options)
-    for image_id in image_ids:
-        if options.verbose:
-            print "Prefetching image '%s'" % image_id
-
-        try:
-            client.prefetch_cache_image(image_id)
-        except exception.NotFound:
-            print "No image with ID %s was found" % image_id
-            continue
-
-    if options.verbose:
-        print "done"
-
-
-@catch_error('show prefetching images')
-def cache_prefetching(options, args):
-    """
-%(prog)s cache-prefetching [options]
-
-List images that are being prefetched"""
-    client = get_client(options)
-    images = client.get_prefetching_cache_images()
-    if not images:
-        print "No images being prefetched."
-        return SUCCESS
-
-    print "Found %d images being prefetched..." % len(images)
-
-    pretty_table = utils.PrettyTable()
-    pretty_table.add_column(16, label="ID")
-    pretty_table.add_column(30, label="Name")
-    pretty_table.add_column(19, label="Last Accessed (UTC)")
-    pretty_table.add_column(10, label="Status", just="r")
-
-    print pretty_table.make_header()
-
-    for image in images:
-        print pretty_table.make_row(
-            image['id'],
-            image['name'],
-            image['last_accessed'],
-            image['status'])
 
 
 @catch_error('show image members')
@@ -970,6 +818,7 @@ def get_client(options):
     specified by the --host and --port options
     supplied to the CLI
     """
+<<<<<<< HEAD
     creds = dict(username=os.getenv('OS_AUTH_USER'),
                  password=os.getenv('OS_AUTH_KEY'),
                  tenant=os.getenv('OS_AUTH_TENANT'),
@@ -978,6 +827,20 @@ def get_client(options):
 
     return glance_client.Client(host=options.host, port=options.port,
                                 auth_tok=options.auth_token, creds=creds)
+=======
+    return glance_client.get_client(host=options.host,
+                port=options.port,
+                use_ssl=options.use_ssl,
+                username=options.os_username,
+                password=options.os_password,
+                tenant=options.os_tenant_name,
+                auth_url=options.os_auth_url,
+                auth_strategy=options.os_auth_strategy,
+                auth_token=options.os_auth_token,
+                region=options.os_region_name,
+                is_silent_upload=options.is_silent_upload,
+                insecure=options.insecure)
+>>>>>>> upstream/master
 
 
 def create_options(parser):
@@ -987,6 +850,10 @@ def create_options(parser):
 
     :param parser: The option parser
     """
+    parser.add_option('--silent-upload', default=False, action="store_true",
+                      dest="is_silent_upload",
+                      help="disable progress bar animation and information "
+                      "during upload")
     parser.add_option('-v', '--verbose', default=False, action="store_true",
                       help="Print more verbose output")
     parser.add_option('-d', '--debug', default=False, action="store_true",
@@ -995,13 +862,52 @@ def create_options(parser):
                       help="Address of Glance API host. "
                            "Default: %default")
     parser.add_option('-p', '--port', dest="port", metavar="PORT",
-                      type=int, default=9292,
+                      type=int, default=DEFAULT_PORT,
                       help="Port the Glance API host listens on. "
                            "Default: %default")
-    parser.add_option('-A', '--auth_token', dest="auth_token",
-                      metavar="TOKEN", default=None,
+    parser.add_option('--ssl', dest='use_ssl',
+                      default=False, action="store_true",
+                      help="Use SSL when talking to Glance API host")
+    parser.add_option('-U', '--url', metavar="URL", default=None,
+                      help="URL of Glance service. This option can be used "
+                           "to specify the hostname, port and protocol "
+                           "(http/https) of the glance server, for example "
+                           "-U https://localhost:" + str(DEFAULT_PORT) +
+                           "/v1 Default: None. If given, this option will "
+                           "override settings for --host, --port, and --ssl.")
+    parser.add_option('-k', '--insecure', dest="insecure",
+                      default=False, action="store_true",
+                      help="Explicitly allow glance to perform \"insecure\" "
+                      "SSL (https) requests. The server's certificate will "
+                      "not be verified against any certificate authorities. "
+                      "This option should be used with caution.")
+    parser.add_option('-A', '--os_auth_token', '--auth_token',
+                      dest="os_auth_token", metavar="TOKEN", default=None,
                       help="Authentication token to use to identify the "
-                           "client to the glance server")
+                           "client to the glance server.  --auth_token "
+                           "is deprecated and will be removed")
+    parser.add_option('-I', '--os_username', dest="os_username",
+                      metavar="USER", default=None,
+                      help="User name used to acquire an authentication token")
+    parser.add_option('-K', '--os_password', dest="os_password",
+                      metavar="PASSWORD", default=None,
+                      help="Password used to acquire an authentication token")
+    parser.add_option('-R', '--os_region_name', dest="os_region_name",
+                      metavar="REGION", default=None,
+                      help="Region name. When using keystone authentication "
+                      "version 2.0 or later this identifies the region "
+                      "name to use when selecting the service endpoint. A "
+                      "region name must be provided if more than one "
+                      "region endpoint is available")
+    parser.add_option('-T', '--os_tenant_name', dest="os_tenant_name",
+                      metavar="TENANT", default=None,
+                      help="Tenant name")
+    parser.add_option('-N', '--os_auth_url', dest="os_auth_url",
+                      metavar="AUTH_URL", default=None,
+                      help="Authentication URL")
+    parser.add_option('-S', '--os_auth_strategy', dest="os_auth_strategy",
+                      metavar="STRATEGY", default=None,
+                      help="Authentication strategy (keystone or noauth)")
     parser.add_option('--limit', dest="limit", metavar="LIMIT", default=10,
                       type="int", help="Page size to use while "
                                        "requesting image metadata")
@@ -1012,7 +918,7 @@ def create_options(parser):
                       help="Sort results by this image attribute.")
     parser.add_option('--sort_dir', dest="sort_dir", metavar="[desc|asc]",
                       help="Sort results in this direction.")
-    parser.add_option('-f', '--force', dest="force", metavar="FORCE",
+    parser.add_option('-f', '--force', dest="force",
                       default=False, action="store_true",
                       help="Prevent select actions from requesting "
                            "user confirmation")
@@ -1034,6 +940,11 @@ def parse_options(parser, cli_args):
         cli_args.append('-h')  # Show options in usage output...
 
     (options, args) = parser.parse_args(cli_args)
+    if options.url is not None:
+        u = urlparse(options.url)
+        options.port = u.port
+        options.host = u.hostname
+        options.use_ssl = (u.scheme == 'https')
 
     # HACK(sirp): Make the parser available to the print_help method
     # print_help is a command, so it only accepts (options, args); we could
@@ -1077,17 +988,6 @@ def lookup_command(parser, command_name):
                 'show': image_show,
                 'clear': images_clear}
 
-    CACHE_COMMANDS = {
-                'cache-index': cache_index,
-                'cache-invalid': cache_invalid,
-                'cache-incomplete': cache_incomplete,
-                'cache-prefetching': cache_prefetching,
-                'cache-prefetch': cache_prefetch,
-                'cache-purge': cache_purge,
-                'cache-clear': cache_clear,
-                'cache-reap-invalid': cache_reap_invalid,
-                'cache-reap-stalled': cache_reap_stalled}
-
     MEMBER_COMMANDS = {
                 'image-members': image_members,
                 'member-images': member_images,
@@ -1096,7 +996,7 @@ def lookup_command(parser, command_name):
                 'member-delete': member_delete}
 
     commands = {}
-    for command_set in (BASE_COMMANDS, IMAGE_COMMANDS, CACHE_COMMANDS,
+    for command_set in (BASE_COMMANDS, IMAGE_COMMANDS,
                         MEMBER_COMMANDS):
         commands.update(command_set)
 
@@ -1122,6 +1022,10 @@ def user_confirm(prompt, default=False):
         prompt_default = "[Y/n]"
     else:
         prompt_default = "[y/N]"
+
+    # for bug 884116, don't issue the prompt if stdin isn't a tty
+    if not hasattr(sys.stdin, 'isatty') or not sys.stdin.isatty():
+        return default
 
     answer = raw_input("%s %s " % (prompt, prompt_default))
 
@@ -1156,28 +1060,6 @@ Commands:
     clear           Removes all images and metadata from Glance
 
 
-Cache Commands:
-
-    cache-index          List all images currently cached
-
-    cache-invalid        List current invalid cache images
-
-    cache-incomplete     List images currently being fetched
-
-    cache-prefetching    List images that are being prefetched
-
-    cache-prefetch       Pre-fetch an image or list of images into the cache
-
-    cache-purge          Purges an image from the cache
-
-    cache-clear          Removes all images from the cache
-
-    cache-reap-invalid   Reaps any invalid images that were left for
-                         debugging purposes
-
-    cache-reap-stalled   Reaps any stalled incomplete images
-
-
 Member Commands:
 
     image-members    List members an image is shared with
@@ -1204,5 +1086,9 @@ Member Commands:
         if options.verbose:
             print "Completed in %-0.4f sec." % (end_time - start_time)
         sys.exit(result)
-    except (RuntimeError, NotImplementedError), e:
-        print "ERROR: ", e
+    except (RuntimeError,
+            NotImplementedError,
+            exception.ClientConfigurationError), e:
+        oparser.print_usage()
+        print >> sys.stderr, "ERROR: ", e
+        sys.exit(1)

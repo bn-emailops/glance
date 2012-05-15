@@ -28,15 +28,18 @@ class Store(object):
 
     CHUNKSIZE = (16 * 1024 * 1024)  # 16M
 
-    def __init__(self, options=None):
+    def __init__(self, conf):
         """
         Initialize the Store
 
-        :param options: Optional dictionary of configuration options
+        :param conf: Optional dictionary of configuration options
         """
-        self.options = options or {}
+        self.conf = conf
+
+        self.configure()
+
         try:
-            self.configure()
+            self.configure_add()
         except exception.BadStoreConfiguration:
             msg = _("Failed to configure store correctly. "
                     "Disabling add method.")
@@ -47,8 +50,17 @@ class Store(object):
         """
         Configure the Store to use the stored configuration options
         Any store that needs special configuration should implement
-        this method. If the store was not able to successfully configure
-        itself, it should raise `exception.BadStoreConfiguration`
+        this method.
+        """
+        pass
+
+    def configure_add(self):
+        """
+        This is like `configure` except that it's specifically for
+        configuring the store to accept objects.
+
+        If the store was not able to successfully configure
+        itself, it should raise `exception.BadStoreConfiguration`.
         """
         pass
 
@@ -57,6 +69,20 @@ class Store(object):
         Takes a `glance.store.location.Location` object that indicates
         where to find the image file, and returns a tuple of generator
         (for reading the image file) and image_size
+<<<<<<< HEAD
+=======
+
+        :param location `glance.store.location.Location` object, supplied
+                        from glance.store.location.get_location_from_uri()
+        :raises `glance.exception.NotFound` if image does not exist
+        """
+        raise NotImplementedError
+
+    def get_size(self, location):
+        """
+        Takes a `glance.store.location.Location` object that indicates
+        where to find the image file, and returns the size
+>>>>>>> upstream/master
 
         :param location `glance.store.location.Location` object, supplied
                         from glance.store.location.get_location_from_uri()

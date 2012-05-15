@@ -33,15 +33,15 @@ from glance.common import exception
 logger = logging.getLogger('glance.registry.db.migration')
 
 
-def db_version(options):
+def db_version(conf):
     """
     Return the database's current migration number
 
-    :param options: options dict
+    :param conf: conf dict
     :retval version number
     """
     repo_path = get_migrate_repo_path()
-    sql_connection = options['sql_connection']
+    sql_connection = conf.sql_connection
     try:
         return versioning_api.db_version(sql_connection, repo_path)
     except versioning_exceptions.DatabaseNotControlledError, e:
@@ -50,85 +50,112 @@ def db_version(options):
         raise exception.DatabaseMigrationError(msg)
 
 
-def upgrade(options, version=None):
+def upgrade(conf, version=None):
     """
     Upgrade the database's current migration level
 
-    :param options: options dict
+    :param conf: conf dict
     :param version: version to upgrade (defaults to latest)
     :retval version number
     """
-    db_version(options)  # Ensure db is under migration control
+    db_version(conf)  # Ensure db is under migration control
     repo_path = get_migrate_repo_path()
-    sql_connection = options['sql_connection']
+    sql_connection = conf.sql_connection
     version_str = version or 'latest'
     logger.info(_("Upgrading %(sql_connection)s to version %(version_str)s") %
                 locals())
     return versioning_api.upgrade(sql_connection, repo_path, version)
 
 
-def downgrade(options, version):
+def downgrade(conf, version):
     """
     Downgrade the database's current migration level
 
-    :param options: options dict
+    :param conf: conf dict
     :param version: version to downgrade to
     :retval version number
     """
-    db_version(options)  # Ensure db is under migration control
+    db_version(conf)  # Ensure db is under migration control
     repo_path = get_migrate_repo_path()
-    sql_connection = options['sql_connection']
+    sql_connection = conf.sql_connection
     logger.info(_("Downgrading %(sql_connection)s to version %(version)s") %
                 locals())
     return versioning_api.downgrade(sql_connection, repo_path, version)
 
 
+<<<<<<< HEAD
 def version_control(options, version=None):
+=======
+def version_control(conf, version=None):
+>>>>>>> upstream/master
     """
     Place a database under migration control
 
-    :param options: options dict
+    :param conf: conf dict
     """
-    sql_connection = options['sql_connection']
+    sql_connection = conf.sql_connection
     try:
+<<<<<<< HEAD
         _version_control(options, version)
+=======
+        _version_control(conf, version)
+>>>>>>> upstream/master
     except versioning_exceptions.DatabaseAlreadyControlledError, e:
         msg = (_("database '%(sql_connection)s' is already under migration "
                "control") % locals())
         raise exception.DatabaseMigrationError(msg)
 
 
+<<<<<<< HEAD
 def _version_control(options, version=None):
+=======
+def _version_control(conf, version):
+>>>>>>> upstream/master
     """
     Place a database under migration control
 
-    :param options: options dict
+    :param conf: conf dict
     """
     repo_path = get_migrate_repo_path()
+<<<<<<< HEAD
     sql_connection = options['sql_connection']
+=======
+    sql_connection = conf.sql_connection
+>>>>>>> upstream/master
     if version is None:
         version = versioning_repository.Repository(repo_path).latest
     return versioning_api.version_control(sql_connection, repo_path, version)
 
 
+<<<<<<< HEAD
 def db_sync(options, version=None, current_version=None):
+=======
+def db_sync(conf, version=None, current_version=None):
+>>>>>>> upstream/master
     """
     Place a database under migration control and perform an upgrade
 
-    :param options: options dict
+    :param conf: conf dict
     :retval version number
     """
+<<<<<<< HEAD
     sql_connection = options['sql_connection']
     try:
         _version_control(options, current_version)
     except versioning_exceptions.DatabaseAlreadyControlledError, e:
         pass
+=======
+    sql_connection = conf.sql_connection
+    try:
+        _version_control(conf, current_version)
+    except versioning_exceptions.DatabaseAlreadyControlledError, e:
+>>>>>>> upstream/master
         if current_version is not None:
             msg = (_("database '%(sql_connection)s' is already under "
                      "migration control") % locals())
             raise exception.DatabaseMigrationError(msg)
 
-    upgrade(options, version=version)
+    upgrade(conf, version=version)
 
 
 def get_migrate_repo_path():

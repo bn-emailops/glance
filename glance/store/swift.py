@@ -23,11 +23,10 @@ import hashlib
 import httplib
 import logging
 import math
-import tempfile
 import urlparse
 
-from glance.common import config
 from glance.common import exception
+from glance.openstack.common import cfg
 import glance.store
 import glance.store.base
 import glance.store.location
@@ -38,8 +37,9 @@ except ImportError:
     pass
 
 DEFAULT_CONTAINER = 'glance'
-DEFAULT_LARGE_OBJECT_SIZE = 5 * 1024 * 1024 * 1024  # 5GB
-DEFAULT_LARGE_OBJECT_CHUNK_SIZE = 200 * 1024 * 1024  # 200M
+DEFAULT_LARGE_OBJECT_SIZE = 5 * 1024  # 5GB
+DEFAULT_LARGE_OBJECT_CHUNK_SIZE = 200  # 200M
+ONE_MB = 1000 * 1024
 
 logger = logging.getLogger('glance.store.swift')
 
@@ -79,12 +79,14 @@ class StoreLocation(glance.store.location.StoreLocation):
             authurl = authurl[7:]
         elif authurl.startswith('https://'):
             authurl = authurl[8:]
-        return "%s://%s%s/%s/%s" % (
-            self.scheme,
-            self._get_credstring(),
-            authurl,
-            self.container,
-            self.obj)
+
+        credstring = self._get_credstring()
+        authurl = authurl.strip('/')
+        container = self.container.strip('/')
+        obj = self.obj.strip('/')
+
+        return '%s://%s%s/%s/%s' % (self.scheme, credstring, authurl,
+                                    container, obj)
 
     def parse_uri(self, uri):
         """
@@ -99,12 +101,14 @@ class StoreLocation(glance.store.location.StoreLocation):
         # swift://user:pass@http://authurl.com/v1/container/obj
         # are immediately rejected.
         if uri.count('://') != 1:
-            reason = _("URI Cannot contain more than one occurrence of a "
-                      "scheme. If you have specified a "
-                      "URI like swift://user:pass@http://authurl.com/v1/"
-                      "container/obj, you need to change it to use the "
-                      "swift+http:// scheme, like so: "
-                      "swift+http://user:pass@authurl.com/v1/container/obj")
+            reason = _(
+                    "URI cannot contain more than one occurrence of a scheme."
+                    "If you have specified a URI like "
+                    "swift://user:pass@http://authurl.com/v1/container/obj"
+                    ", you need to change it to use the swift+http:// scheme, "
+                    "like so: "
+                    "swift+http://user:pass@authurl.com/v1/container/obj"
+                    )
             raise exception.BadStoreUri(uri, reason)
 
         pieces = urlparse.urlparse(uri)
@@ -183,7 +187,27 @@ class Store(glance.store.base.Store):
 
     CHUNKSIZE = 65536
 
+    opts = [
+        cfg.BoolOpt('swift_enable_snet', default=False),
+        cfg.StrOpt('swift_store_auth_address'),
+        cfg.StrOpt('swift_store_user', secret=True),
+        cfg.StrOpt('swift_store_key', secret=True),
+        cfg.StrOpt('swift_store_auth_version', default='2'),
+        cfg.StrOpt('swift_store_container',
+                   default=DEFAULT_CONTAINER),
+        cfg.IntOpt('swift_store_large_object_size',
+                   default=DEFAULT_LARGE_OBJECT_SIZE),
+        cfg.IntOpt('swift_store_large_object_chunk_size',
+                   default=DEFAULT_LARGE_OBJECT_CHUNK_SIZE),
+        cfg.BoolOpt('swift_store_create_container_on_put', default=False),
+        ]
+
     def configure(self):
+        self.conf.register_opts(self.opts)
+        self.snet = self.conf.swift_enable_snet
+        self.auth_version = self._option_get('swift_store_auth_version')
+
+    def configure_add(self):
         """
         Configure the Store to use the stored configuration options
         Any store that needs special configuration should implement
@@ -193,24 +217,17 @@ class Store(glance.store.base.Store):
         self.auth_address = self._option_get('swift_store_auth_address')
         self.user = self._option_get('swift_store_user')
         self.key = self._option_get('swift_store_key')
-        self.container = self.options.get('swift_store_container',
-                                          DEFAULT_CONTAINER)
+        self.container = self.conf.swift_store_container
         try:
-            if self.options.get('swift_store_large_object_size'):
-                self.large_object_size = int(
-                    self.options.get('swift_store_large_object_size')
-                    ) * (1024 * 1024)  # Size specified in MB in conf files
-            else:
-                self.large_object_size = DEFAULT_LARGE_OBJECT_SIZE
-
-            if self.options.get('swift_store_large_object_chunk_size'):
-                self.large_object_chunk_size = int(
-                    self.options.get('swift_store_large_object_chunk_size')
-                    ) * (1024 * 1024)  # Size specified in MB in conf files
-            else:
-                self.large_object_chunk_size = DEFAULT_LARGE_OBJECT_CHUNK_SIZE
-        except Exception, e:
-            reason = _("Error in configuration options: %s") % e
+            # The config file has swift_store_large_object_*size in MB, but
+            # internally we store it in bytes, since the image_size parameter
+            # passed to add() is also in bytes.
+            self.large_object_size = \
+                self.conf.swift_store_large_object_size * ONE_MB
+            self.large_object_chunk_size = \
+                self.conf.swift_store_large_object_chunk_size * ONE_MB
+        except cfg.ConfigFileValueError, e:
+            reason = _("Error in configuration conf: %s") % e
             logger.error(reason)
             raise exception.BadStoreConfiguration(store_name="swift",
                                                   reason=reason)
@@ -223,9 +240,6 @@ class Store(glance.store.base.Store):
             self.full_auth_address = self.auth_address
         else:  # Defaults https
             self.full_auth_address = 'https://' + self.auth_address
-
-        self.snet = config.get_option(
-            self.options, 'swift_enable_snet', type='bool', default=False)
 
     def get(self, location):
         """
@@ -253,28 +267,63 @@ class Store(glance.store.base.Store):
             else:
                 raise
 
-        #if expected_size:
-        #    obj_size = int(resp_headers['content-length'])
-        #    if  obj_size != expected_size:
-        #        raise glance.store.BackendException(
-        #            "Expected %s byte file, Swift has %s bytes" %
-        #            (expected_size, obj_size))
+        class ResponseIndexable(glance.store.Indexable):
+            def another(self):
+                try:
+                    return self.wrapped.next()
+                except StopIteration:
+                    return ''
 
+        length = resp_headers.get('content-length')
+        return (ResponseIndexable(resp_body, length), length)
+
+    def get_size(self, location):
+        """
+        Takes a `glance.store.location.Location` object that indicates
+        where to find the image file, and returns the image_size (or 0
+        if unavailable)
+
+        :param location `glance.store.location.Location` object, supplied
+                        from glance.store.location.get_location_from_uri()
+        """
+        loc = location.store_location
+        swift_conn = self._make_swift_connection(
+            auth_url=loc.swift_auth_url, user=loc.user, key=loc.key)
+
+<<<<<<< HEAD
         return (resp_body, resp_headers.get('content-length'))
+=======
+        try:
+            resp_headers = swift_conn.head_object(container=loc.container,
+                                                  obj=loc.obj)
+            return resp_headers.get('content-length', 0)
+        except Exception:
+            return 0
+>>>>>>> upstream/master
 
     def _make_swift_connection(self, auth_url, user, key):
         """
         Creates a connection using the Swift client library.
         """
         snet = self.snet
+        auth_version = self.auth_version
+        full_auth_url = (auth_url if not auth_url or auth_url.endswith('/')
+                         else auth_url + '/')
         logger.debug(_("Creating Swift connection with "
+<<<<<<< HEAD
                      "(auth_address=%(auth_url)s, user=%(user)s, "
                      "snet=%(snet)s)") % locals())
+=======
+                     "(auth_address=%(full_auth_url)s, user=%(user)s, "
+                     "snet=%(snet)s, auth_version=%(auth_version)s)") %
+                     locals())
+>>>>>>> upstream/master
         return swift_client.Connection(
-            authurl=auth_url, user=user, key=key, snet=snet)
+            authurl=full_auth_url, user=user, key=key, snet=snet,
+            auth_version=auth_version)
 
     def _option_get(self, param):
-        result = self.options.get(param)
+        result = getattr(self.conf, param)
         if not result:
             reason = (_("Could not find %(param)s in configuration "
                         "options.") % locals())
@@ -314,11 +363,14 @@ class Store(glance.store.base.Store):
               in size. So, if the image is greater than 5GB, we write
               chunks of image data to Swift and then write an manifest
               to Swift that contains information about the chunks.
+              This same chunking process is used by default for images
+              of an unknown size, as pushing them directly to swift would
+              fail if the image turns out to be greater than 5GB.
         """
         swift_conn = self._make_swift_connection(
             auth_url=self.full_auth_address, user=self.user, key=self.key)
 
-        create_container_if_missing(self.container, swift_conn, self.options)
+        create_container_if_missing(self.container, swift_conn, self.conf)
 
         obj_name = str(image_id)
         location = StoreLocation({'scheme': self.scheme,
@@ -331,13 +383,11 @@ class Store(glance.store.base.Store):
         logger.debug(_("Adding image object '%(obj_name)s' "
                        "to Swift") % locals())
         try:
-            if image_size < self.large_object_size:
-                # image_size == 0 is when we don't know the size
-                # of the image. This can occur with older clients
-                # that don't inspect the payload size, and we simply
-                # try to put the object into Swift and hope for the
-                # best...
+            if image_size > 0 and image_size < self.large_object_size:
+                # Image size is known, and is less than large_object_size.
+                # Send to Swift with regular PUT.
                 obj_etag = swift_conn.put_object(self.container, obj_name,
+<<<<<<< HEAD
                                                  image_file)
 
                 if image_size == 0:
@@ -346,44 +396,65 @@ class Store(glance.store.base.Store):
                     # header keys are lowercased by Swift
                     if 'content-length' in resp_headers:
                         image_size = int(resp_headers['content-length'])
+=======
+                                                 image_file,
+                                                 content_length=image_size)
+>>>>>>> upstream/master
             else:
-                # Write the image into Swift in chunks. We cannot
-                # stream chunks of the webob.Request.body_file, unfortunately,
-                # so we must write chunks of the body_file into a temporary
-                # disk buffer, and then pass this disk buffer to Swift.
-                bytes_left = image_size
+                # Write the image into Swift in chunks.
                 chunk_id = 1
-                total_chunks = int(math.ceil(
-                    float(image_size) / float(self.large_object_chunk_size)))
+                if image_size > 0:
+                    total_chunks = str(int(
+                        math.ceil(float(image_size) /
+                                  float(self.large_object_chunk_size))))
+                else:
+                    # image_size == 0 is when we don't know the size
+                    # of the image. This can occur with older clients
+                    # that don't inspect the payload size.
+                    logger.debug(_("Cannot determine image size. Adding as a "
+                                   "segmented object to Swift."))
+                    total_chunks = '?'
+
                 checksum = hashlib.md5()
-                while bytes_left > 0:
-                    with tempfile.NamedTemporaryFile() as disk_buffer:
-                        chunk_size = min(self.large_object_chunk_size,
-                                         bytes_left)
-                        logger.debug(_("Writing %(chunk_size)d bytes for "
-                                       "chunk %(chunk_id)d/"
-                                       "%(total_chunks)d to disk buffer "
-                                       "for image %(image_id)s")
-                                     % locals())
-                        chunk = image_file.read(chunk_size)
-                        checksum.update(chunk)
-                        disk_buffer.write(chunk)
-                        disk_buffer.flush()
-                        logger.debug(_("Writing chunk %(chunk_id)d/"
-                                       "%(total_chunks)d to Swift "
-                                       "for image %(image_id)s")
-                                     % locals())
-                        chunk_etag = swift_conn.put_object(
-                            self.container,
-                            "%s-%05d" % (obj_name, chunk_id),
-                            open(disk_buffer.name, 'rb'))
-                        logger.debug(_("Wrote chunk %(chunk_id)d/"
-                                       "%(total_chunks)d to Swift "
-                                       "returning MD5 of content: "
-                                       "%(chunk_etag)s")
-                                     % locals())
-                    bytes_left -= self.large_object_chunk_size
+                combined_chunks_size = 0
+                while True:
+                    chunk_size = self.large_object_chunk_size
+                    if image_size == 0:
+                        content_length = None
+                    else:
+                        left = image_size - combined_chunks_size
+                        if left == 0:
+                            break
+                        if chunk_size > left:
+                            chunk_size = left
+                        content_length = chunk_size
+
+                    chunk_name = "%s-%05d" % (obj_name, chunk_id)
+                    reader = ChunkReader(image_file, checksum, chunk_size)
+                    chunk_etag = swift_conn.put_object(
+                        self.container, chunk_name, reader,
+                        content_length=content_length)
+                    bytes_read = reader.bytes_read
+                    logger.debug(_("Wrote chunk %(chunk_id)d/"
+                                   "%(total_chunks)s of length %(bytes_read)d "
+                                   "to Swift returning MD5 of content: "
+                                   "%(chunk_etag)s")
+                                 % locals())
+
+                    if bytes_read == 0:
+                        # Delete the last chunk, because it's of zero size.
+                        # This will happen if image_size == 0.
+                        logger.debug(_("Deleting final zero-length chunk"))
+                        swift_conn.delete_object(self.container, chunk_name)
+                        break
+
                     chunk_id += 1
+                    combined_chunks_size += bytes_read
+
+                # In the case we have been given an unknown image size,
+                # set the image_size to the total size of the combined chunks.
+                if image_size == 0:
+                    image_size = combined_chunks_size
 
                 # Now we write the object manifest and return the
                 # manifest's etag...
@@ -396,8 +467,8 @@ class Store(glance.store.base.Store):
                 # of each chunk...so we ignore this result in favour of
                 # the MD5 of the entire image file contents, so that
                 # users can verify the image file contents accordingly
-                _ignored = swift_conn.put_object(self.container, obj_name,
-                                                 None, headers=headers)
+                swift_conn.put_object(self.container, obj_name,
+                                      None, headers=headers)
                 obj_etag = checksum.hexdigest()
 
             # NOTE: We return the user and key here! Have to because
@@ -465,26 +536,40 @@ class Store(glance.store.base.Store):
                 raise
 
 
-def create_container_if_missing(container, swift_conn, options):
+class ChunkReader(object):
+    def __init__(self, fd, checksum, total):
+        self.fd = fd
+        self.checksum = checksum
+        self.total = total
+        self.bytes_read = 0
+
+    def read(self, i):
+        left = self.total - self.bytes_read
+        if i > left:
+            i = left
+        result = self.fd.read(i)
+        self.bytes_read += len(result)
+        self.checksum.update(result)
+        return result
+
+
+def create_container_if_missing(container, swift_conn, conf):
     """
     Creates a missing container in Swift if the
     ``swift_store_create_container_on_put`` option is set.
 
     :param container: Name of container to create
     :param swift_conn: Connection to Swift
-    :param options: Option mapping
+    :param conf: Option mapping
     """
     try:
         swift_conn.head_container(container)
     except swift_client.ClientException, e:
         if e.http_status == httplib.NOT_FOUND:
-            add_container = config.get_option(options,
-                                'swift_store_create_container_on_put',
-                                type='bool', default=False)
-            if add_container:
+            if conf.swift_store_create_container_on_put:
                 try:
                     swift_conn.put_container(container)
-                except ClientException, e:
+                except swift_client.ClientException, e:
                     msg = _("Failed to add container to Swift.\n"
                            "Got error from Swift: %(e)s") % locals()
                     raise glance.store.BackendException(msg)

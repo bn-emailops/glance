@@ -25,19 +25,22 @@ and spinning down the servers.
 
 import datetime
 import functools
+import json
 import os
-import random
+import re
 import shutil
 import signal
 import socket
-import tempfile
 import time
 import unittest
 import urlparse
 
-from glance.tests.utils import execute, get_unused_port
-
 from sqlalchemy import create_engine
+
+from glance.common import utils
+from glance.tests import utils as test_utils
+
+execute, get_unused_port = test_utils.execute, test_utils.get_unused_port
 
 
 def runs_sql(func):
@@ -50,14 +53,19 @@ def runs_sql(func):
     @functools.wraps(func)
     def wrapped(*a, **kwargs):
         test_obj = a[0]
-        orig_sql_connection = test_obj.registry_server.sql_connection
+        orig_reg_sql_connection = test_obj.registry_server.sql_connection
+        orig_api_sql_connection = test_obj.api_server.sql_connection
         try:
-            if orig_sql_connection.startswith('sqlite'):
+            if orig_reg_sql_connection.startswith('sqlite'):
                 test_obj.registry_server.sql_connection =\
+                        "sqlite:///tests.sqlite"
+            if orig_api_sql_connection.startswith('sqlite'):
+                test_obj.api_server.sql_connection =\
                         "sqlite:///tests.sqlite"
             func(*a, **kwargs)
         finally:
-            test_obj.registry_server.sql_connection = orig_sql_connection
+            test_obj.registry_server.sql_connection = orig_reg_sql_connection
+            test_obj.api_server.sql_connection = orig_api_sql_connection
     return wrapped
 
 
@@ -79,18 +87,23 @@ class Server(object):
         self.no_venv = False
         self.test_dir = test_dir
         self.bind_port = port
-        self.conf_file = None
+        self.conf_file_name = None
         self.conf_base = None
+        self.paste_conf_base = None
         self.server_control = './bin/glance-control'
         self.exec_env = None
+        self.deployment_flavor = ''
+        self.server_control_options = ''
 
     def write_conf(self, **kwargs):
         """
         Writes the configuration file for the server to its intended
-        destination.  Returns the name of the configuration file.
+        destination.  Returns the name of the configuration file and
+        the over-ridden config content (may be useful for populating
+        error messages).
         """
 
-        if self.conf_file:
+        if self.conf_file_name:
             return self.conf_file_name
         if not self.conf_base:
             raise RuntimeError("Subclass did not populate config_base!")
@@ -99,18 +112,34 @@ class Server(object):
         if kwargs:
             conf_override.update(**kwargs)
 
-        # A config file to use just for this test...we don't want
+        # A config file and paste.ini to use just for this test...we don't want
         # to trample on currently-running Glance servers, now do we?
 
-        conf_file = tempfile.NamedTemporaryFile()
-        conf_file.write(self.conf_base % conf_override)
-        conf_file.flush()
-        self.conf_file = conf_file
-        self.conf_file_name = conf_file.name
+        conf_dir = os.path.join(self.test_dir, 'etc')
+        conf_filepath = os.path.join(conf_dir, "%s.conf" % self.server_name)
+        paste_conf_filepath = conf_filepath.replace(".conf", "-paste.ini")
+        utils.safe_mkdirs(conf_dir)
 
-        return self.conf_file_name
+        def override_conf(filepath, overridden):
+            with open(filepath, 'wb') as conf_file:
+                conf_file.write(overridden)
+                conf_file.flush()
+                return conf_file.name
 
-    def start(self, **kwargs):
+        overridden_core = self.conf_base % conf_override
+        self.conf_file_name = override_conf(conf_filepath, overridden_core)
+
+        overridden_paste = ''
+        if self.paste_conf_base:
+            overridden_paste = self.paste_conf_base % conf_override
+            override_conf(paste_conf_filepath, overridden_paste)
+
+        overridden = ('==Core config==\n%s\n==Paste config==\n%s' %
+                      (overridden_core, overridden_paste))
+
+        return self.conf_file_name, overridden
+
+    def start(self, expect_exit=True, expected_exitcode=0, **kwargs):
         """
         Starts the server.
 
@@ -119,12 +148,18 @@ class Server(object):
         """
 
         # Ensure the configuration file is written
-        self.write_conf(**kwargs)
+        overridden = self.write_conf(**kwargs)[1]
 
         cmd = ("%(server_control)s %(server_name)s start "
-               "%(conf_file_name)s --pid-file=%(pid_file)s"
+               "%(conf_file_name)s --pid-file=%(pid_file)s "
+               "%(server_control_options)s"
                % self.__dict__)
-        return execute(cmd, no_venv=self.no_venv, exec_env=self.exec_env)
+        return execute(cmd,
+                       no_venv=self.no_venv,
+                       exec_env=self.exec_env,
+                       expect_exit=expect_exit,
+                       expected_exitcode=expected_exitcode,
+                       context=overridden)
 
     def stop(self):
         """
@@ -133,7 +168,8 @@ class Server(object):
         cmd = ("%(server_control)s %(server_name)s stop "
                "%(conf_file_name)s --pid-file=%(pid_file)s"
                % self.__dict__)
-        return execute(cmd, no_venv=self.no_venv, exec_env=self.exec_env)
+        return execute(cmd, no_venv=self.no_venv, exec_env=self.exec_env,
+                       expect_exit=True)
 
 
 class ApiServer(Server):
@@ -142,14 +178,20 @@ class ApiServer(Server):
     Server object that starts/stops/manages the API server
     """
 
-    def __init__(self, test_dir, port, registry_port, delayed_delete=False):
+    def __init__(self, test_dir, port, registry_port, policy_file,
+            delayed_delete=False):
         super(ApiServer, self).__init__(test_dir, port)
         self.server_name = 'api'
         self.default_store = 'file'
+        self.key_file = ""
+        self.cert_file = ""
+        self.metadata_encryption_key = "012345678901234567890123456789ab"
         self.image_dir = os.path.join(self.test_dir,
                                          "images")
         self.pid_file = os.path.join(self.test_dir,
                                          "api.pid")
+        self.scrubber_datadir = os.path.join(self.test_dir,
+                                             "scrubber")
         self.log_file = os.path.join(self.test_dir, "api.log")
         self.registry_port = registry_port
         self.s3_store_host = "s3.amazonaws.com"
@@ -162,8 +204,24 @@ class ApiServer(Server):
         self.swift_store_container = ""
         self.swift_store_large_object_size = 5 * 1024
         self.swift_store_large_object_chunk_size = 200
+        self.rbd_store_ceph_conf = ""
+        self.rbd_store_pool = ""
+        self.rbd_store_user = ""
+        self.rbd_store_chunk_size = 4
         self.delayed_delete = delayed_delete
         self.owner_is_tenant = True
+        self.workers = 0
+        self.image_cache_dir = os.path.join(self.test_dir,
+                                            'cache')
+        self.image_cache_driver = 'sqlite'
+        self.policy_file = policy_file
+        self.policy_default_rule = 'default'
+        self.server_control_options = '--capture-output'
+
+        default_sql_connection = 'sqlite:///'
+        self.sql_connection = os.environ.get('GLANCE_TEST_SQL_CONNECTION',
+                                             default_sql_connection)
+
         self.conf_base = """[DEFAULT]
 verbose = %(verbose)s
 debug = %(debug)s
@@ -171,6 +229,9 @@ filesystem_store_datadir=%(image_dir)s
 default_store = %(default_store)s
 bind_host = 0.0.0.0
 bind_port = %(bind_port)s
+key_file = %(key_file)s
+cert_file = %(cert_file)s
+metadata_encryption_key = %(metadata_encryption_key)s
 registry_host = 0.0.0.0
 registry_port = %(registry_port)s
 log_file = %(log_file)s
@@ -184,26 +245,84 @@ swift_store_key = %(swift_store_key)s
 swift_store_container = %(swift_store_container)s
 swift_store_large_object_size = %(swift_store_large_object_size)s
 swift_store_large_object_chunk_size = %(swift_store_large_object_chunk_size)s
+rbd_store_chunk_size = %(rbd_store_chunk_size)s
+rbd_store_user = %(rbd_store_user)s
+rbd_store_pool = %(rbd_store_pool)s
+rbd_store_ceph_conf = %(rbd_store_ceph_conf)s
 delayed_delete = %(delayed_delete)s
 owner_is_tenant = %(owner_is_tenant)s
+workers = %(workers)s
+scrub_time = 5
+scrubber_datadir = %(scrubber_datadir)s
+image_cache_dir = %(image_cache_dir)s
+image_cache_driver = %(image_cache_driver)s
+policy_file = %(policy_file)s
+policy_default_rule = %(policy_default_rule)s
+sql_connection = %(sql_connection)s
+[paste_deploy]
+flavor = %(deployment_flavor)s
+"""
+        self.paste_conf_base = """[pipeline:glance-api]
+pipeline = versionnegotiation unauthenticated-context rootapp
 
-[pipeline:glance-api]
-pipeline = versionnegotiation context apiv1app
+[pipeline:glance-api-caching]
+pipeline = versionnegotiation unauthenticated-context cache rootapp
 
-[pipeline:versions]
-pipeline = versionsapp
+[pipeline:glance-api-cachemanagement]
+pipeline =
+    versionnegotiation
+    unauthenticated-context
+    cache
+    cache_manage
+    rootapp
 
-[app:versionsapp]
-paste.app_factory = glance.api.versions:app_factory
+[pipeline:glance-api-fakeauth]
+pipeline = versionnegotiation fakeauth context rootapp
+
+[pipeline:glance-api-noauth]
+pipeline = versionnegotiation context rootapp
+
+[composite:rootapp]
+use = egg:Paste#urlmap
+/: apiversions
+/v1: apiv1app
+/v2: apiv2app
+
+[app:apiversions]
+paste.app_factory = glance.api.versions:create_resource
 
 [app:apiv1app]
-paste.app_factory = glance.api.v1:app_factory
+paste.app_factory = glance.common.wsgi:app_factory
+glance.app_factory = glance.api.v1.router:API
+
+[app:apiv2app]
+paste.app_factory = glance.common.wsgi:app_factory
+glance.app_factory = glance.api.v2.router:API
 
 [filter:versionnegotiation]
-paste.filter_factory = glance.api.middleware.version_negotiation:filter_factory
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory =
+ glance.api.middleware.version_negotiation:VersionNegotiationFilter
+
+[filter:cache]
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.api.middleware.cache:CacheFilter
+
+[filter:cache_manage]
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.api.middleware.cache_manage:CacheManageFilter
 
 [filter:context]
-paste.filter_factory = glance.common.context:filter_factory
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.common.context:ContextMiddleware
+
+[filter:unauthenticated-context]
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.common.context:UnauthenticatedContextMiddleware
+
+[filter:fakeauth]
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.tests.utils:FakeAuthMiddleware
 """
 
 
@@ -225,6 +344,7 @@ class RegistryServer(Server):
                                          "registry.pid")
         self.log_file = os.path.join(self.test_dir, "registry.log")
         self.owner_is_tenant = True
+        self.server_control_options = '--capture-output'
         self.conf_base = """[DEFAULT]
 verbose = %(verbose)s
 debug = %(debug)s
@@ -236,16 +356,30 @@ sql_idle_timeout = 3600
 api_limit_max = 1000
 limit_param_default = 25
 owner_is_tenant = %(owner_is_tenant)s
+[paste_deploy]
+flavor = %(deployment_flavor)s
+"""
+        self.paste_conf_base = """[pipeline:glance-registry]
+pipeline = unauthenticated-context registryapp
 
-[pipeline:glance-registry]
-pipeline = context registryapp
+[pipeline:glance-registry-fakeauth]
+pipeline = fakeauth context registryapp
 
 [app:registryapp]
-paste.app_factory = glance.registry.server:app_factory
+paste.app_factory = glance.common.wsgi:app_factory
+glance.app_factory = glance.registry.api.v1:API
 
 [filter:context]
-context_class = glance.registry.context.RequestContext
-paste.filter_factory = glance.common.context:filter_factory
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.common.context:ContextMiddleware
+
+[filter:unauthenticated-context]
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.common.context:UnauthenticatedContextMiddleware
+
+[filter:fakeauth]
+paste.filter_factory = glance.common.wsgi:filter_factory
+glance.filter_factory = glance.tests.utils:FakeAuthMiddleware
 """
 
 
@@ -254,28 +388,30 @@ class ScrubberDaemon(Server):
     Server object that starts/stops/manages the Scrubber server
     """
 
-    def __init__(self, test_dir, sql_connection, daemon=False):
+    def __init__(self, test_dir, registry_port, daemon=False):
         # NOTE(jkoelker): Set the port to 0 since we actually don't listen
         super(ScrubberDaemon, self).__init__(test_dir, 0)
         self.server_name = 'scrubber'
         self.daemon = daemon
 
-        self.sql_connection = sql_connection
-
+        self.registry_port = registry_port
+        self.scrubber_datadir = os.path.join(self.test_dir,
+                                             "scrubber")
         self.pid_file = os.path.join(self.test_dir, "scrubber.pid")
         self.log_file = os.path.join(self.test_dir, "scrubber.log")
         self.conf_base = """[DEFAULT]
 verbose = %(verbose)s
 debug = %(debug)s
 log_file = %(log_file)s
-scrub_time = 5
 daemon = %(daemon)s
 wakeup_time = 2
-sql_connection = %(sql_connection)s
-sql_idle_timeout = 3600
-
-[app:glance-scrubber]
-paste.app_factory = glance.store.scrubber:app_factory
+scrubber_datadir = %(scrubber_datadir)s
+registry_host = 0.0.0.0
+registry_port = %(registry_port)s
+"""
+        self.paste_conf_base = """[app:glance-scrubber]
+paste.app_factory = glance.common.wsgi:app_factory
+glance.app_factory = glance.store.scrubber:Scrubber
 """
 
 
@@ -286,30 +422,39 @@ class FunctionalTest(unittest.TestCase):
     servers and clients and not just the stubbed out interfaces
     """
 
+    inited = False
     disabled = False
+    log_files = []
 
     def setUp(self):
+        self.test_id, self.test_dir = test_utils.get_isolated_test_env()
 
-        self.test_id = random.randint(0, 100000)
-        self.test_dir = os.path.join("/", "tmp", "test.%d" % self.test_id)
-
+        self.api_protocol = 'http'
         self.api_port = get_unused_port()
         self.registry_port = get_unused_port()
 
+        conf_dir = os.path.join(self.test_dir, 'etc')
+        utils.safe_mkdirs(conf_dir)
+        self.copy_data_file('schema-image.json', conf_dir)
+        self.copy_data_file('schema-access.json', conf_dir)
+        self.copy_data_file('policy.json', conf_dir)
+        self.policy_file = os.path.join(conf_dir, 'policy.json')
+
         self.api_server = ApiServer(self.test_dir,
                                     self.api_port,
-                                    self.registry_port)
+                                    self.registry_port,
+                                    self.policy_file)
         self.registry_server = RegistryServer(self.test_dir,
                                               self.registry_port)
 
-        registry_db = self.registry_server.sql_connection
         self.scrubber_daemon = ScrubberDaemon(self.test_dir,
-                                              sql_connection=registry_db)
+                                              self.registry_port)
 
         self.pid_files = [self.api_server.pid_file,
                           self.registry_server.pid_file,
                           self.scrubber_daemon.pid_file]
         self.files_to_destroy = []
+        self.log_files = []
 
     def tearDown(self):
         if not self.disabled:
@@ -318,6 +463,12 @@ class FunctionalTest(unittest.TestCase):
             # and recreate it, which ensures that we have no side-effects
             # from the tests
             self._reset_database(self.registry_server.sql_connection)
+            self._reset_database(self.api_server.sql_connection)
+
+    def set_policy_rules(self, rules):
+        fap = open(self.policy_file, 'w')
+        fap.write(json.dumps(rules))
+        fap.close()
 
     def _reset_database(self, conn_string):
         conn_pieces = urlparse.urlparse(conn_string)
@@ -368,11 +519,46 @@ class FunctionalTest(unittest.TestCase):
             if os.path.exists(f):
                 os.unlink(f)
 
+    def start_server(self,
+                     server,
+                     expect_launch,
+                     expect_exit=True,
+                     expected_exitcode=0,
+                     **kwargs):
+        """
+        Starts a server on an unused port.
+
+        Any kwargs passed to this method will override the configuration
+        value in the conf file used in starting the server.
+
+        :param server: the server to launch
+        :param expect_launch: true iff the server is expected to
+                              successfully start
+        :param expect_exit: true iff the launched server is expected
+                            to exit in a timely fashion
+        :param expected_exitcode: expected exitcode from the launcher
+        """
+        self.cleanup()
+
+        # Start up the requested server
+        exitcode, out, err = server.start(expect_exit=expect_exit,
+                                          expected_exitcode=expected_exitcode,
+                                          **kwargs)
+        if expect_exit:
+            self.assertEqual(expected_exitcode, exitcode,
+                             "Failed to spin up the requested server. "
+                             "Got: %s" % err)
+
+            self.assertTrue(re.search("Starting glance-[a-z]+ with", out))
+
+        self.log_files.append(server.log_file)
+
+        self.wait_for_servers([server.bind_port], expect_launch)
+
     def start_servers(self, **kwargs):
         """
-        Starts the API and Registry servers (bin/glance-api and
-        bin/glance-registry) on unused ports and returns a tuple
-        of the (api_port, registry_port, conf_file_name).
+        Starts the API and Registry servers (bin/glance-control api start
+        & bin/glance-control registry start) on unused ports.
 
         Any kwargs passed to this method will override the configuration
         value in the conf file used in starting the servers.
@@ -382,12 +568,16 @@ class FunctionalTest(unittest.TestCase):
         # Start up the API and default registry server
         exitcode, out, err = self.api_server.start(**kwargs)
 
+        self.log_files.append(self.api_server.log_file)
+
         self.assertEqual(0, exitcode,
                          "Failed to spin up the API server. "
                          "Got: %s" % err)
         self.assertTrue("Starting glance-api with" in out)
 
         exitcode, out, err = self.registry_server.start(**kwargs)
+
+        self.log_files.append(self.registry_server.log_file)
 
         self.assertEqual(0, exitcode,
                          "Failed to spin up the Registry server. "
@@ -401,7 +591,7 @@ class FunctionalTest(unittest.TestCase):
                          "Got: %s" % err)
         self.assertTrue("Starting glance-scrubber with" in out)
 
-        self.wait_for_servers()
+        self.wait_for_servers([self.api_port, self.registry_port])
 
     def ping_server(self, port):
         """
@@ -419,23 +609,44 @@ class FunctionalTest(unittest.TestCase):
         except socket.error, e:
             return False
 
-    def wait_for_servers(self, timeout=3):
+    def wait_for_servers(self, ports, expect_launch=True, timeout=3):
         """
-        Tight loop, waiting for both API and registry server to be
-        available on the ports. Returns when both are pingable. There
-        is a timeout on waiting for the servers to come up.
+        Tight loop, waiting for the given server port(s) to be available.
+        Returns when all are pingable. There is a timeout on waiting
+        for the servers to come up.
 
+        :param ports: Glance server ports to ping
+        :param expect_launch: Optional, true iff the server(s) are
+                              expected to successfully start
         :param timeout: Optional, defaults to 3 seconds
         """
         now = datetime.datetime.now()
         timeout_time = now + datetime.timedelta(seconds=timeout)
         while (timeout_time > now):
-            if self.ping_server(self.api_port) and\
-               self.ping_server(self.registry_port):
+            pinged = 0
+            for port in ports:
+                if self.ping_server(port):
+                    pinged += 1
+            if pinged == len(ports):
+                self.assertTrue(expect_launch,
+                                "Unexpected server launch status")
                 return
             now = datetime.datetime.now()
             time.sleep(0.05)
-        self.assertFalse(True, "Failed to start servers.")
+        self.assertFalse(expect_launch, "Unexpected server launch status")
+
+    def stop_server(self, server, name):
+        """
+        Called to stop a single server in a normal fashion using the
+        glance-control stop method to gracefully shut the server down.
+
+        :param server: the server to stop
+        """
+        # Spin down the requested server
+        exitcode, out, err = server.stop()
+        self.assertEqual(0, exitcode,
+                         "Failed to spin down the %s server. Got: %s" %
+                         (err, name))
 
     def stop_servers(self):
         """
@@ -448,20 +659,10 @@ class FunctionalTest(unittest.TestCase):
         """
 
         # Spin down the API and default registry server
-        exitcode, out, err = self.api_server.stop()
-        self.assertEqual(0, exitcode,
-                         "Failed to spin down the API server. "
-                         "Got: %s" % err)
+        self.stop_server(self.api_server, 'API server')
+        self.stop_server(self.registry_server, 'Registry server')
+        self.stop_server(self.scrubber_daemon, 'Scrubber daemon')
 
-        exitcode, out, err = self.registry_server.stop()
-        self.assertEqual(0, exitcode,
-                         "Failed to spin down the Registry server. "
-                         "Got: %s" % err)
-
-        exitcode, out, err = self.scrubber_daemon.stop()
-        self.assertEqual(0, exitcode,
-                         "Failed to spin down the Scrubber daemon. "
-                         "Got: %s" % err)
         # If all went well, then just remove the test directory.
         # We only want to check the logs and stuff if something
         # went wrong...
@@ -484,3 +685,21 @@ class FunctionalTest(unittest.TestCase):
         engine = create_engine(self.registry_server.sql_connection,
                                pool_recycle=30)
         return engine.execute(sql)
+
+    def copy_data_file(self, file_name, dst_dir):
+        src_file_name = os.path.join('glance/tests/etc', file_name)
+        shutil.copy(src_file_name, dst_dir)
+        dst_file_name = os.path.join(dst_dir, file_name)
+        return dst_file_name
+
+    def dump_logs(self):
+        dump = ''
+        for log in self.log_files:
+            dump += '\nContent of %s:\n\n' % log
+            if os.path.exists(log):
+                f = open(log, 'r')
+                for line in f:
+                    dump += line
+            else:
+                dump += '<empty>'
+        return dump

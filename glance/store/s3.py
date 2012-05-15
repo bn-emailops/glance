@@ -20,11 +20,13 @@
 import logging
 import hashlib
 import httplib
+import re
 import tempfile
 import urlparse
 
-from glance.common import config
 from glance.common import exception
+from glance.common import utils
+from glance.openstack.common import cfg
 import glance.store
 import glance.store.base
 import glance.store.location
@@ -187,13 +189,23 @@ class Store(glance.store.base.Store):
 
     EXAMPLE_URL = "s3://<ACCESS_KEY>:<SECRET_KEY>@<S3_URL>/<BUCKET>/<OBJ>"
 
-    def configure(self):
+    opts = [
+        cfg.StrOpt('s3_store_host'),
+        cfg.StrOpt('s3_store_access_key', secret=True),
+        cfg.StrOpt('s3_store_secret_key', secret=True),
+        cfg.StrOpt('s3_store_bucket'),
+        cfg.StrOpt('s3_store_object_buffer_dir'),
+        cfg.BoolOpt('s3_store_create_bucket_on_put', default=False),
+        ]
+
+    def configure_add(self):
         """
         Configure the Store to use the stored configuration options
         Any store that needs special configuration should implement
         this method. If the store was not able to successfully configure
         itself, it should raise `exception.BadStoreConfiguration`
         """
+        self.conf.register_opts(self.opts)
         self.s3_host = self._option_get('s3_store_host')
         access_key = self._option_get('s3_store_access_key')
         secret_key = self._option_get('s3_store_secret_key')
@@ -214,8 +226,11 @@ class Store(glance.store.base.Store):
         else:  # Defaults http
             self.full_s3_host = 'http://' + self.s3_host
 
+        self.s3_store_object_buffer_dir = \
+            self.conf.s3_store_object_buffer_dir
+
     def _option_get(self, param):
-        result = self.options.get(param)
+        result = getattr(self.conf, param)
         if not result:
             reason = _("Could not find %(param)s in configuration "
                        "options.") % locals()
@@ -234,6 +249,33 @@ class Store(glance.store.base.Store):
                         from glance.store.location.get_location_from_uri()
         :raises `glance.exception.NotFound` if image does not exist
         """
+        key = self._retrieve_key(location)
+
+        key.BufferSize = self.CHUNKSIZE
+
+        class ChunkedIndexable(glance.store.Indexable):
+            def another(self):
+                return (self.wrapped.fp.read(ChunkedFile.CHUNKSIZE)
+                        if self.wrapped.fp else None)
+
+        return (ChunkedIndexable(ChunkedFile(key), key.size), key.size)
+
+    def get_size(self, location):
+        """
+        Takes a `glance.store.location.Location` object that indicates
+        where to find the image file, and returns the image_size (or 0
+        if unavailable)
+
+        :param location `glance.store.location.Location` object, supplied
+                        from glance.store.location.get_location_from_uri()
+        """
+        try:
+            key = self._retrieve_key(location)
+            return key.size
+        except Exception:
+            return 0
+
+    def _retrieve_key(self, location):
         loc = location.store_location
         from boto.s3.connection import S3Connection
 
@@ -251,6 +293,7 @@ class Store(glance.store.base.Store):
                 'obj_name': loc.key})
         logger.debug(msg)
 
+<<<<<<< HEAD
         #if expected_size and (key.size != expected_size):
         #   msg = "Expected %s bytes, got %s" % (expected_size, key.size)
         #   logger.error(msg)
@@ -258,6 +301,9 @@ class Store(glance.store.base.Store):
 
         key.BufferSize = self.CHUNKSIZE
         return (ChunkedFile(key), key.size)
+=======
+        return key
+>>>>>>> upstream/master
 
     def add(self, image_id, image_file, image_size):
         """
@@ -295,15 +341,21 @@ class Store(glance.store.base.Store):
                                host=loc.s3serviceurl,
                                is_secure=(loc.scheme == 's3+https'))
 
-        create_bucket_if_missing(self.bucket, s3_conn, self.options)
+        create_bucket_if_missing(self.bucket, s3_conn, self.conf)
 
         bucket_obj = get_bucket(s3_conn, self.bucket)
         obj_name = str(image_id)
 
+        def _sanitize(uri):
+            return re.sub('//.*:.*@',
+                          '//s3_store_secret_key:s3_store_access_key@',
+                          uri)
+
         key = bucket_obj.get_key(obj_name)
         if key and key.exists():
             raise exception.Duplicate(_("S3 already has an image at "
-                                      "location %s") % loc.get_uri())
+                                      "location %s") %
+                                      _sanitize(loc.get_uri()))
 
         msg = _("Adding image object to S3 using (s3_host=%(s3_host)s, "
                 "access_key=%(access_key)s, bucket=%(bucket)s, "
@@ -327,19 +379,19 @@ class Store(glance.store.base.Store):
         # writing the tempfile, so we don't need to call key.compute_md5()
 
         msg = _("Writing request body file to temporary file "
-                "for %s") % loc.get_uri()
+                "for %s") % _sanitize(loc.get_uri())
         logger.debug(msg)
-        temp_file = tempfile.NamedTemporaryFile()
 
+        tmpdir = self.s3_store_object_buffer_dir
+        temp_file = tempfile.NamedTemporaryFile(dir=tmpdir)
         checksum = hashlib.md5()
-        chunk = image_file.read(self.CHUNKSIZE)
-        while chunk:
+        for chunk in utils.chunkreadable(image_file, self.CHUNKSIZE):
             checksum.update(chunk)
             temp_file.write(chunk)
-            chunk = image_file.read(self.CHUNKSIZE)
         temp_file.flush()
 
-        msg = _("Uploading temporary file to S3 for %s") % loc.get_uri()
+        msg = (_("Uploading temporary file to S3 for %s") %
+               _sanitize(loc.get_uri()))
         logger.debug(msg)
 
         # OK, now upload the data into the key
@@ -400,26 +452,40 @@ def get_bucket(conn, bucket_id):
     return bucket
 
 
-def create_bucket_if_missing(bucket, s3_conn, options):
+def get_s3_location(s3_host):
+    from boto.s3.connection import Location
+    locations = {
+        's3.amazonaws.com': Location.DEFAULT,
+        's3-eu-west-1.amazonaws.com': Location.EU,
+        's3-us-west-1.amazonaws.com': Location.USWest,
+        's3-ap-southeast-1.amazonaws.com': Location.APSoutheast,
+        's3-ap-northeast-1.amazonaws.com': Location.APNortheast,
+    }
+    # strip off scheme and port if present
+    key = re.sub('^(https?://)?(?P<host>[^:]+)(:[0-9]+)?$',
+                 '\g<host>',
+                 s3_host)
+    return locations.get(key, Location.DEFAULT)
+
+
+def create_bucket_if_missing(bucket, s3_conn, conf):
     """
     Creates a missing bucket in S3 if the
     ``s3_store_create_bucket_on_put`` option is set.
 
     :param bucket: Name of bucket to create
     :param s3_conn: Connection to S3
-    :param options: Option mapping
+    :param conf: Option mapping
     """
     from boto.exception import S3ResponseError
     try:
         s3_conn.get_bucket(bucket)
     except S3ResponseError, e:
         if e.status == httplib.NOT_FOUND:
-            add_bucket = config.get_option(options,
-                                's3_store_create_bucket_on_put',
-                                type='bool', default=False)
-            if add_bucket:
+            if conf.s3_store_create_bucket_on_put:
+                location = get_s3_location(conf.s3_store_host)
                 try:
-                    s3_conn.create_bucket(bucket)
+                    s3_conn.create_bucket(bucket, location=location)
                 except S3ResponseError, e:
                     msg = ("Failed to add bucket to S3.\n"
                            "Got error from S3: %(e)s" % locals())

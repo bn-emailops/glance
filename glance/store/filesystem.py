@@ -19,12 +19,15 @@
 A simple filesystem-backed store
 """
 
+import errno
 import hashlib
 import logging
 import os
 import urlparse
 
 from glance.common import exception
+from glance.common import utils
+from glance.openstack.common import cfg
 import glance.store
 import glance.store.base
 import glance.store.location
@@ -93,14 +96,24 @@ class ChunkedFile(object):
 
 class Store(glance.store.base.Store):
 
-    def configure(self):
+    datadir_opt = cfg.StrOpt('filesystem_store_datadir')
+
+    def configure_add(self):
         """
         Configure the Store to use the stored configuration options
         Any store that needs special configuration should implement
         this method. If the store was not able to successfully configure
         itself, it should raise `exception.BadStoreConfiguration`
         """
-        self.datadir = self._option_get('filesystem_store_datadir')
+        self.conf.register_opt(self.datadir_opt)
+
+        self.datadir = self.conf.filesystem_store_datadir
+        if self.datadir is None:
+            reason = _("Could not find %s in configuration options.") % \
+                'filesystem_store_datadir'
+            logger.error(reason)
+            raise exception.BadStoreConfiguration(store_name="filesystem",
+                                                  reason=reason)
 
         if not os.path.exists(self.datadir):
             msg = _("Directory to write image files does not exist "
@@ -113,15 +126,6 @@ class Store(glance.store.base.Store):
                 logger.error(reason)
                 raise exception.BadStoreConfiguration(store_name="filesystem",
                                                       reason=reason)
-
-    def _option_get(self, param):
-        result = self.options.get(param)
-        if not result:
-            reason = _("Could not find %s in configuration options.") % param
-            logger.error(reason)
-            raise exception.BadStoreConfiguration(store_name="filesystem",
-                                                  reason=reason)
-        return result
 
     def get(self, location):
         """
@@ -151,7 +155,7 @@ class Store(glance.store.base.Store):
                   from glance.store.location.get_location_from_uri()
 
         :raises NotFound if image does not exist
-        :raises NotAuthorized if cannot delete because of permissions
+        :raises Forbidden if cannot delete because of permissions
         """
         loc = location.store_location
         fn = loc.path
@@ -160,8 +164,7 @@ class Store(glance.store.base.Store):
                 logger.debug(_("Deleting image at %(fn)s") % locals())
                 os.unlink(fn)
             except OSError:
-                raise exception.NotAuthorized(_("You cannot delete file %s")
-                                                % fn)
+                raise exception.Forbidden(_("You cannot delete file %s") % fn)
         else:
             raise exception.NotFound(_("Image file %s does not exist") % fn)
 
@@ -193,14 +196,20 @@ class Store(glance.store.base.Store):
 
         checksum = hashlib.md5()
         bytes_written = 0
-        with open(filepath, 'wb') as f:
-            while True:
-                buf = image_file.read(ChunkedFile.CHUNKSIZE)
-                if not buf:
-                    break
-                bytes_written += len(buf)
-                checksum.update(buf)
-                f.write(buf)
+        try:
+            with open(filepath, 'wb') as f:
+                for buf in utils.chunkreadable(image_file,
+                                              ChunkedFile.CHUNKSIZE):
+                    bytes_written += len(buf)
+                    checksum.update(buf)
+                    f.write(buf)
+        except IOError as e:
+            if e.errno in [errno.EFBIG, errno.ENOSPC]:
+                raise exception.StorageFull()
+            elif e.errno == errno.EACCES:
+                raise exception.StorageWriteDenied()
+            else:
+                raise
 
         checksum_hex = checksum.hexdigest()
 

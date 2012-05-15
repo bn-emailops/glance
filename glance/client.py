@@ -20,15 +20,22 @@ Client classes for callers of a Glance system
 """
 
 import errno
+import httplib
 import json
+import logging
 import os
+import socket
+import sys
 
-from glance.api.v1 import images as v1_images
+import glance.api.v1
+from glance.common import animation
 from glance.common import client as base_client
 from glance.common import exception
-from glance import utils
+from glance.common import utils
 
-#TODO(jaypipes) Allow a logger param for client classes
+logger = logging.getLogger(__name__)
+SUPPORTED_PARAMS = glance.api.v1.SUPPORTED_PARAMS
+SUPPORTED_FILTERS = glance.api.v1.SUPPORTED_FILTERS
 
 
 class V1Client(base_client.BaseClient):
@@ -49,7 +56,7 @@ class V1Client(base_client.BaseClient):
         :param sort_key: results will be ordered by this image attribute
         :param sort_dir: direction in which to to order results (asc, desc)
         """
-        params = self._extract_params(kwargs, v1_images.SUPPORTED_PARAMS)
+        params = self._extract_params(kwargs, SUPPORTED_PARAMS)
         res = self.do_request("GET", "/images", params=params)
         data = json.loads(res.read())['images']
         return data
@@ -65,7 +72,7 @@ class V1Client(base_client.BaseClient):
         :param sort_key: results will be ordered by this image attribute
         :param sort_dir: direction in which to to order results (asc, desc)
         """
-        params = self._extract_params(kwargs, v1_images.SUPPORTED_PARAMS)
+        params = self._extract_params(kwargs, SUPPORTED_PARAMS)
         res = self.do_request("GET", "/images/detail", params=params)
         data = json.loads(res.read())['images']
         return data
@@ -123,7 +130,11 @@ class V1Client(base_client.BaseClient):
                 else:
                     raise
 
+<<<<<<< HEAD
     def add_image(self, image_meta=None, image_data=None):
+=======
+    def add_image(self, image_meta=None, image_data=None, features=None):
+>>>>>>> upstream/master
         """
         Tells Glance about an image's metadata as well
         as optionally the image_data itself
@@ -133,6 +144,7 @@ class V1Client(base_client.BaseClient):
         :param image_data: Optional string of raw image data
                            or file-like object that can be
                            used to read the image data
+        :param features:   Optional map of features
 
         :retval The newly-stored image's metadata.
         """
@@ -148,13 +160,24 @@ class V1Client(base_client.BaseClient):
         else:
             body = None
 
+        utils.add_features_to_http_headers(features, headers)
+
         res = self.do_request("POST", "/images", body, headers)
         data = json.loads(res.read())
         return data['image']
 
-    def update_image(self, image_id, image_meta=None, image_data=None):
+    def update_image(self, image_id, image_meta=None, image_data=None,
+                     features=None):
         """
         Updates Glance's information about an image
+
+        :param image_id:   Required image ID
+        :param image_meta: Optional Mapping of information about the
+                           image
+        :param image_data: Optional string of raw image data
+                           or file-like object that can be
+                           used to read the image data
+        :param features:   Optional map of features
         """
         if image_meta is None:
             image_meta = {}
@@ -171,6 +194,8 @@ class V1Client(base_client.BaseClient):
         else:
             body = None
 
+        utils.add_features_to_http_headers(features, headers)
+
         res = self.do_request("PUT", "/images/%s" % image_id, body, headers)
         data = json.loads(res.read())
         return data['image']
@@ -185,117 +210,57 @@ class V1Client(base_client.BaseClient):
     def get_cached_images(self, **kwargs):
         """
         Returns a list of images stored in the image cache.
-
-        :param filters: dictionary of attributes by which the resulting
-                        collection of images should be filtered
-        :param marker: id after which to start the page of images
-        :param limit: maximum number of items to return
-        :param sort_key: results will be ordered by this image attribute
-        :param sort_dir: direction in which to to order results (asc, desc)
         """
-        params = self._extract_params(kwargs, v1_images.SUPPORTED_PARAMS)
-        res = self.do_request("GET", "/cached_images", params=params)
+        res = self.do_request("GET", "/cached_images")
         data = json.loads(res.read())['cached_images']
         return data
 
-    def get_invalid_cached_images(self, **kwargs):
+    def get_queued_images(self, **kwargs):
         """
-        Returns a list of invalid images stored in the image cache.
-
-        :param filters: dictionary of attributes by which the resulting
-                        collection of images should be filtered
-        :param marker: id after which to start the page of images
-        :param limit: maximum number of items to return
-        :param sort_key: results will be ordered by this image attribute
-        :param sort_dir: direction in which to to order results (asc, desc)
+        Returns a list of images queued for caching
         """
-        params = self._extract_params(kwargs, v1_images.SUPPORTED_PARAMS)
-        params['status'] = 'invalid'
-        res = self.do_request("GET", "/cached_images", params=params)
-        data = json.loads(res.read())['cached_images']
+        res = self.do_request("GET", "/queued_images")
+        data = json.loads(res.read())['queued_images']
         return data
 
-    def get_incomplete_cached_images(self, **kwargs):
-        """
-        Returns a list of incomplete images being fetched into cache
-
-        :param filters: dictionary of attributes by which the resulting
-                        collection of images should be filtered
-        :param marker: id after which to start the page of images
-        :param limit: maximum number of items to return
-        :param sort_key: results will be ordered by this image attribute
-        :param sort_dir: direction in which to to order results (asc, desc)
-        """
-        params = self._extract_params(kwargs, v1_images.SUPPORTED_PARAMS)
-        params['status'] = 'incomplete'
-        res = self.do_request("GET", "/cached_images", params=params)
-        data = json.loads(res.read())['cached_images']
-        return data
-
-    def purge_cached_image(self, image_id):
+    def delete_cached_image(self, image_id):
         """
         Delete a specified image from the cache
         """
         self.do_request("DELETE", "/cached_images/%s" % image_id)
         return True
 
-    def clear_cached_images(self):
+    def delete_all_cached_images(self):
         """
-        Clear all cached images
+        Delete all cached images
         """
         res = self.do_request("DELETE", "/cached_images")
         data = json.loads(res.read())
-        num_purged = data['num_purged']
-        return num_purged
+        num_deleted = data['num_deleted']
+        return num_deleted
 
-    def reap_invalid_cached_images(self, **kwargs):
+    def queue_image_for_caching(self, image_id):
         """
-        Reaps any invalid cached images
+        Queue an image for prefetching into cache
         """
-        params = self._extract_params(kwargs, v1_images.SUPPORTED_PARAMS)
-        params['status'] = 'invalid'
-        res = self.do_request("DELETE", "/cached_images", params=params)
-        data = json.loads(res.read())
-        num_reaped = data['num_reaped']
-        return num_reaped
-
-    def reap_stalled_cached_images(self, **kwargs):
-        """
-        Reaps any stalled cached images
-        """
-        params = self._extract_params(kwargs, v1_images.SUPPORTED_PARAMS)
-        params['status'] = 'incomplete'
-        res = self.do_request("DELETE", "/cached_images", params=params)
-        data = json.loads(res.read())
-        num_reaped = data['num_reaped']
-        return num_reaped
-
-    def prefetch_cache_image(self, image_id):
-        """
-        Pre-fetch a specified image from the cache
-        """
-        res = self.do_request("HEAD", "/images/%s" % image_id)
-        image = utils.get_image_meta_from_headers(res)
-        self.do_request("PUT", "/cached_images/%s" % image_id)
+        self.do_request("PUT", "/queued_images/%s" % image_id)
         return True
 
-    def get_prefetching_cache_images(self, **kwargs):
+    def delete_queued_image(self, image_id):
         """
-        Returns a list of images which are actively being prefetched or are
-        queued to be prefetched in the future.
+        Delete a specified image from the cache queue
+        """
+        self.do_request("DELETE", "/queued_images/%s" % image_id)
+        return True
 
-        :param filters: dictionary of attributes by which the resulting
-                        collection of images should be filtered
-        :param marker: id after which to start the page of images
-        :param limit: maximum number of items to return
-        :param sort_key: results will be ordered by this image attribute
-        :param sort_dir: direction in which to to order results (asc, desc)
+    def delete_all_queued_images(self):
         """
-        params = self._extract_params(kwargs, v1_images.SUPPORTED_PARAMS)
-        params['status'] = 'prefetching'
-        res = self.do_request("GET", "/cached_images", params=params)
-        data = json.loads(res.read())['cached_images']
-        return data
+        Delete all queued images
+        """
+        res = self.do_request("DELETE", "/queued_images")
+        data = json.loads(res.read())
+        num_deleted = data['num_deleted']
+        return num_deleted
 
     def get_image_members(self, image_id):
         """Returns a mapping of image memberships from Registry"""
@@ -386,4 +351,100 @@ class V1Client(base_client.BaseClient):
         return True
 
 
+class ProgressIteratorWrapper(object):
+
+    def __init__(self, wrapped, transfer_info):
+        self.wrapped = wrapped
+        self.transfer_info = transfer_info
+        self.prev_len = 0L
+
+    def __iter__(self):
+        for chunk in self.wrapped:
+            if self.prev_len:
+                self.transfer_info['so_far'] += self.prev_len
+            self.prev_len = len(chunk)
+            yield chunk
+            # report final chunk
+        self.transfer_info['so_far'] += self.prev_len
+
+
+class ProgressClient(V1Client):
+
+    """
+    Specialized class that adds progress bar output/interaction into the
+    TTY of the calling client
+    """
+    def image_iterator(self, connection, headers, body):
+        wrapped = super(ProgressClient, self).image_iterator(connection,
+                                                                headers,
+                                                                body)
+        try:
+            # spawn the animation thread if the connection is good
+            connection.connect()
+            return ProgressIteratorWrapper(wrapped,
+                                        self.start_animation(headers))
+        except (httplib.HTTPResponse, socket.error):
+            # the connection is out, just "pass"
+            # and let the "glance add" fail with [Errno 111] Connection refused
+            pass
+
+    def start_animation(self, headers):
+        transfer_info = {
+            'so_far': 0L,
+            'size': headers.get('x-image-meta-size', 0L)
+        }
+        pg = animation.UploadProgressStatus(transfer_info)
+        if transfer_info['size'] == 0L:
+            sys.stdout.write("The progressbar doesn't show-up because "
+                            "the headers[x-meta-size] is zero or missing\n")
+        sys.stdout.write("Uploading image '%s'\n" %
+                        headers.get('x-image-meta-name', ''))
+        pg.start()
+        return transfer_info
+
 Client = V1Client
+
+
+def get_client(host, port=None, use_ssl=False, username=None,
+               password=None, tenant=None,
+               auth_url=None, auth_strategy=None,
+               auth_token=None, region=None,
+               is_silent_upload=False, insecure=False):
+    """
+    Returns a new client Glance client object based on common kwargs.
+    If an option isn't specified falls back to common environment variable
+    defaults.
+    """
+
+    if auth_url or os.getenv('OS_AUTH_URL'):
+        force_strategy = 'keystone'
+    else:
+        force_strategy = None
+
+    creds = dict(username=username or
+                         os.getenv('OS_AUTH_USER', os.getenv('OS_USERNAME')),
+                 password=password or
+                         os.getenv('OS_AUTH_KEY', os.getenv('OS_PASSWORD')),
+                 tenant=tenant or
+                         os.getenv('OS_AUTH_TENANT',
+                                 os.getenv('OS_TENANT_NAME')),
+                 auth_url=auth_url or os.getenv('OS_AUTH_URL'),
+                 strategy=force_strategy or auth_strategy or
+                          os.getenv('OS_AUTH_STRATEGY', 'noauth'),
+                 region=region or os.getenv('OS_REGION_NAME'),
+    )
+
+    if creds['strategy'] == 'keystone' and not creds['auth_url']:
+        msg = ("--os_auth_url option or OS_AUTH_URL environment variable "
+               "required when keystone authentication strategy is enabled\n")
+        raise exception.ClientConfigurationError(msg)
+
+    client = (ProgressClient if not is_silent_upload else Client)
+
+    return client(host=host,
+                port=port,
+                use_ssl=use_ssl,
+                auth_tok=auth_token or
+                os.getenv('OS_TOKEN'),
+                creds=creds,
+                insecure=insecure)

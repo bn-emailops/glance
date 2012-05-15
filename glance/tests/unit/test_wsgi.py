@@ -19,6 +19,7 @@ import unittest
 import webob
 
 from glance.common import wsgi
+from glance.common import utils
 from glance.common import exception
 
 
@@ -133,6 +134,9 @@ class JSONResponseSerializerTest(unittest.TestCase):
         response = webob.Response()
         wsgi.JSONResponseSerializer().default(response, fixture)
         self.assertEqual(response.status_int, 200)
+        content_types = filter(lambda h: h[0] == 'Content-Type',
+                               response.headerlist)
+        self.assertEqual(len(content_types), 1)
         self.assertEqual(response.content_type, 'application/json')
         self.assertEqual(response.body, '{"key": "value"}')
 
@@ -182,3 +186,51 @@ class JSONRequestDeserializerTest(unittest.TestCase):
         actual = wsgi.JSONRequestDeserializer().default(request)
         expected = {"body": {"key": "value"}}
         self.assertEqual(actual, expected)
+
+
+class TestHelpers(unittest.TestCase):
+
+    def test_headers_are_unicode(self):
+        """
+        Verifies that the headers returned by conversion code are unicode.
+
+        Headers are passed via http in non-testing mode, which automatically
+        converts them to unicode. Verifying that the method does the
+        conversion proves that we aren't passing data that works in tests
+        but will fail in production.
+        """
+        fixture = {'name': 'fake public image',
+                   'is_public': True,
+                   'type': 'kernel',
+                   'size': 19,
+                   'location': "file:///tmp/glance-tests/2",
+                   'properties': {'distro': 'Ubuntu 10.04 LTS'}}
+        headers = utils.image_meta_to_http_headers(fixture)
+        for k, v in headers.iteritems():
+            self.assert_(isinstance(v, unicode), "%s is not unicode" % v)
+
+    def test_data_passed_properly_through_headers(self):
+        """
+        Verifies that data is the same after being passed through headers
+        """
+        fixture = {'name': 'fake public image',
+                   'is_public': True,
+                   'deleted': False,
+                   'type': 'kernel',
+                   'name': None,
+                   'size': 19,
+                   'location': "file:///tmp/glance-tests/2",
+                   'properties': {'distro': 'Ubuntu 10.04 LTS'}}
+        headers = utils.image_meta_to_http_headers(fixture)
+
+        class FakeResponse():
+            pass
+
+        response = FakeResponse()
+        response.headers = headers
+        result = utils.get_image_meta_from_headers(response)
+        for k, v in fixture.iteritems():
+            if v is not None:
+                self.assertEqual(v, result[k])
+            else:
+                self.assertFalse(k in result)

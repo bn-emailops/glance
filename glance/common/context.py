@@ -14,10 +14,16 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
+<<<<<<< HEAD
 from glance.common import config
+=======
+
+import webob.exc
+
+>>>>>>> upstream/master
 from glance.common import exception
-from glance.common import utils
 from glance.common import wsgi
+from glance.openstack.common import cfg
 from glance.registry.db import api as db_api
 
 
@@ -36,7 +42,7 @@ class RequestContext(object):
         self.roles = roles or []
         self.is_admin = is_admin
         self.read_only = read_only
-        self.show_deleted = show_deleted
+        self._show_deleted = show_deleted
         self.owner_is_tenant = owner_is_tenant
 
     @property
@@ -44,29 +50,131 @@ class RequestContext(object):
         """Return the owner to correlate with an image."""
         return self.tenant if self.owner_is_tenant else self.user
 
+    @property
+    def show_deleted(self):
+        """Admins can see deleted by default"""
+        if self._show_deleted or self.is_admin:
+            return True
+        return False
+
+    def is_image_visible(self, image):
+        """Return True if the image is visible in this context."""
+        # Is admin == image visible
+        if self.is_admin:
+            return True
+
+        # No owner == image visible
+        if image['owner'] is None:
+            return True
+
+        # Image is_public == image visible
+        if image['is_public']:
+            return True
+
+        # Perform tests based on whether we have an owner
+        if self.owner is not None:
+            if self.owner == image['owner']:
+                return True
+
+            # Figure out if this image is shared with that tenant
+            try:
+                tmp = db_api.image_member_find(self, image['id'], self.owner)
+                return not tmp['deleted']
+            except exception.NotFound:
+                pass
+
+        # Private image
+        return False
+
+    def is_image_mutable(self, image):
+        """Return True if the image is mutable in this context."""
+        # Is admin == image mutable
+        if self.is_admin:
+            return True
+
+        # No owner == image not mutable
+        if image['owner'] is None or self.owner is None:
+            return False
+
+        # Image only mutable by its owner
+        return image['owner'] == self.owner
+
+    def is_image_sharable(self, image, **kwargs):
+        """Return True if the image can be shared to others in this context."""
+        # Only allow sharing if we have an owner
+        if self.owner is None:
+            return False
+
+        # Is admin == image sharable
+        if self.is_admin:
+            return True
+
+        # If we own the image, we can share it
+        if self.owner == image['owner']:
+            return True
+
+        # Let's get the membership association
+        if 'membership' in kwargs:
+            membership = kwargs['membership']
+            if membership is None:
+                # Not shared with us anyway
+                return False
+        else:
+            try:
+                membership = db_api.image_member_find(self, image['id'],
+                                                      self.owner)
+            except exception.NotFound:
+                # Not shared with us anyway
+                return False
+
+        # It's the can_share attribute we're now interested in
+        return membership['can_share']
+
 
 class ContextMiddleware(wsgi.Middleware):
-    def __init__(self, app, options):
-        self.options = options
+
+    opts = [
+        cfg.BoolOpt('owner_is_tenant', default=True),
+        cfg.StrOpt('admin_role', default='admin'),
+    ]
+
+    def __init__(self, app, conf, **local_conf):
+        self.conf = conf
+        self.conf.register_opts(self.opts)
         super(ContextMiddleware, self).__init__(app)
 
-    def make_context(self, *args, **kwargs):
+    def process_request(self, req):
+        """Convert authentication informtion into a request context
+
+        Generate a RequestContext object from the available
+        authentication headers and store on the 'context' attribute
+        of the req object.
+
+        :param req: wsgi request object that will be given the context object
+        :raises webob.exc.HTTPUnauthorized: when value of the X-Identity-Status
+                                            header is not 'Confirmed'
         """
-        Create a context with the given arguments.
-        """
+        if req.headers.get('X-Identity-Status') != 'Confirmed':
+            raise webob.exc.HTTPUnauthorized()
 
-        # Determine the context class to use
-        ctxcls = RequestContext
-        if 'context_class' in self.options:
-            ctxcls = utils.import_class(self.options['context_class'])
+        #NOTE(bcwaldon): X-Roles is a csv string, but we need to parse
+        # it into a list to be useful
+        roles_header = req.headers.get('X-Roles', '')
+        roles = [r.strip() for r in roles_header.split(',')]
 
-        # Determine whether to use tenant or owner
-        owner_is_tenant = config.get_option(self.options, 'owner_is_tenant',
-                                            type='bool', default=True)
-        kwargs.setdefault('owner_is_tenant', owner_is_tenant)
+        #NOTE(bcwaldon): This header is deprecated in favor of X-Auth-Token
+        deprecated_token = req.headers.get('X-Storage-Token')
 
-        return ctxcls(*args, **kwargs)
+        kwargs = {
+            'user': req.headers.get('X-User-Id'),
+            'tenant': req.headers.get('X-Tenant-Id'),
+            'roles': roles,
+            'is_admin': self.conf.admin_role in roles,
+            'auth_tok': req.headers.get('X-Auth-Token', deprecated_token),
+            'owner_is_tenant': self.conf.owner_is_tenant,
+        }
 
+<<<<<<< HEAD
     def process_request(self, req):
         """
         Extract any authentication information in the request and
@@ -112,16 +220,24 @@ class ContextMiddleware(wsgi.Middleware):
         req.context = self.make_context(
             auth_tok=auth_tok, user=user, tenant=tenant, roles=roles,
             is_admin=is_admin)
+=======
+        req.context = RequestContext(**kwargs)
+>>>>>>> upstream/master
 
 
-def filter_factory(global_conf, **local_conf):
-    """
-    Factory method for paste.deploy
-    """
-    conf = global_conf.copy()
-    conf.update(local_conf)
+class UnauthenticatedContextMiddleware(wsgi.Middleware):
 
-    def filter(app):
-        return ContextMiddleware(app, conf)
+    def __init__(self, app, conf, **local_conf):
+        self.conf = conf
+        super(UnauthenticatedContextMiddleware, self).__init__(app)
 
-    return filter
+    def process_request(self, req):
+        """Create a context without an authorized user."""
+        kwargs = {
+            'user': None,
+            'tenant': None,
+            'roles': [],
+            'is_admin': True,
+        }
+
+        req.context = RequestContext(**kwargs)

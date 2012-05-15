@@ -1,17 +1,94 @@
+# vim: tabstop=4 shiftwidth=4 softtabstop=4
+
+# Copyright 2010-2011 OpenStack, LLC
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+
+# HTTPSClientAuthConnection code comes courtesy of ActiveState website:
+# http://code.activestate.com/recipes/
+#   577548-https-httplib-client-connection-with-certificate-v/
+
+import collections
+import errno
+import functools
 import httplib
 import logging
-import socket
+import os
+import re
+import select
 import urllib
 import urlparse
 
-# See http://code.google.com/p/python-nose/issues/detail?id=373
-# The code below enables glance.client standalone to work with i18n _() blocks
-import __builtin__
-if not hasattr(__builtin__, '_'):
-    setattr(__builtin__, '_', lambda x: x)
+try:
+    from eventlet.green import socket, ssl
+except ImportError:
+    import socket
+    import ssl
 
+<<<<<<< HEAD
 from glance.common import auth
 from glance.common import exception
+=======
+try:
+    import sendfile
+    SENDFILE_SUPPORTED = True
+except ImportError:
+    SENDFILE_SUPPORTED = False
+
+from glance.common import auth
+from glance.common import exception, utils
+
+LOG = logging.getLogger(__name__)
+
+# common chunk size for get and put
+CHUNKSIZE = 65536
+
+VERSION_REGEX = re.compile(r"/?v[0-9\.]+")
+
+
+def handle_unauthenticated(func):
+    """
+    Wrap a function to re-authenticate and retry.
+    """
+    @functools.wraps(func)
+    def wrapped(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except exception.NotAuthenticated:
+            self._authenticate(force_reauth=True)
+            return func(self, *args, **kwargs)
+    return wrapped
+
+
+def handle_redirects(func):
+    """
+    Wrap the _do_request function to handle HTTP redirects.
+    """
+    MAX_REDIRECTS = 5
+
+    @functools.wraps(func)
+    def wrapped(self, method, url, body, headers):
+        for _ in xrange(MAX_REDIRECTS):
+            try:
+                return func(self, method, url, body, headers)
+            except exception.RedirectException as redirect:
+                if redirect.url is None:
+                    raise exception.InvalidRedirect()
+                url = redirect.url
+        raise exception.MaxRedirectsExceeded(redirects=MAX_REDIRECTS)
+    return wrapped
+>>>>>>> upstream/master
 
 
 class ImageBodyIterator(object):
@@ -22,13 +99,12 @@ class ImageBodyIterator(object):
     tuple from `glance.client.Client.get_image`
     """
 
-    CHUNKSIZE = 65536
-
-    def __init__(self, response):
+    def __init__(self, source):
         """
-        Constructs the object from an HTTPResponse object
+        Constructs the object from a readable image source
+        (such as an HTTPResponse or file-like object)
         """
-        self.response = response
+        self.source = source
 
     def __iter__(self):
         """
@@ -36,23 +112,139 @@ class ImageBodyIterator(object):
         image file.
         """
         while True:
-            chunk = self.response.read(ImageBodyIterator.CHUNKSIZE)
+            chunk = self.source.read(CHUNKSIZE)
             if chunk:
                 yield chunk
             else:
                 break
 
 
+class SendFileIterator:
+    """
+    Emulate iterator pattern over sendfile, in order to allow
+    send progress be followed by wrapping the iteration.
+    """
+    def __init__(self, connection, body):
+        self.connection = connection
+        self.body = body
+        self.offset = 0
+        self.sending = True
+
+    def __iter__(self):
+        class OfLength:
+            def __init__(self, len):
+                self.len = len
+
+            def __len__(self):
+                return self.len
+
+        while self.sending:
+            try:
+                sent = sendfile.sendfile(self.connection.sock.fileno(),
+                                         self.body.fileno(),
+                                         self.offset,
+                                         CHUNKSIZE)
+            except OSError as e:
+                # suprisingly, sendfile may fail transiently instead of
+                # blocking, in which case we select on the socket in order
+                # to wait on its return to a writeable state before resuming
+                # the send loop
+                if e.errno in (errno.EAGAIN, errno.EBUSY):
+                    wlist = [self.connection.sock.fileno()]
+                    rfds, wfds, efds = select.select([], wlist, [])
+                    if wfds:
+                        continue
+                raise
+
+            self.sending = (sent != 0)
+            self.offset += sent
+            yield OfLength(sent)
+
+
+class HTTPSClientAuthConnection(httplib.HTTPSConnection):
+    """
+    Class to make a HTTPS connection, with support for
+    full client-based SSL Authentication
+
+    :see http://code.activestate.com/recipes/
+            577548-https-httplib-client-connection-with-certificate-v/
+    """
+
+    def __init__(self, host, port, key_file, cert_file,
+                 ca_file, timeout=None, insecure=False):
+        httplib.HTTPSConnection.__init__(self, host, port, key_file=key_file,
+                                         cert_file=cert_file)
+        self.key_file = key_file
+        self.cert_file = cert_file
+        self.ca_file = ca_file
+        self.timeout = timeout
+        self.insecure = insecure
+
+    def connect(self):
+        """
+        Connect to a host on a given (SSL) port.
+        If ca_file is pointing somewhere, use it to check Server Certificate.
+
+        Redefined/copied and extended from httplib.py:1105 (Python 2.6.x).
+        This is needed to pass cert_reqs=ssl.CERT_REQUIRED as parameter to
+        ssl.wrap_socket(), which forces SSL to check server certificate against
+        our client certificate.
+        """
+        sock = socket.create_connection((self.host, self.port), self.timeout)
+        if self._tunnel_host:
+            self.sock = sock
+            self._tunnel()
+        # Check CA file unless 'insecure' is specificed
+        if self.insecure is True:
+            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
+                                        cert_reqs=ssl.CERT_NONE)
+        else:
+            self.sock = ssl.wrap_socket(sock, self.key_file, self.cert_file,
+                                        ca_certs=self.ca_file,
+                                        cert_reqs=ssl.CERT_REQUIRED)
+
+
 class BaseClient(object):
 
     """A base client class"""
 
+<<<<<<< HEAD
     CHUNKSIZE = 65536
     DEFAULT_PORT = 80
     DEFAULT_DOC_ROOT = None
 
     def __init__(self, host, port=None, use_ssl=False, auth_tok=None,
                  creds=None, doc_root=None):
+=======
+    DEFAULT_PORT = 80
+    DEFAULT_DOC_ROOT = None
+    # Standard CA file locations for Debian/Ubuntu, RedHat/Fedora,
+    # Suse, FreeBSD/OpenBSD
+    DEFAULT_CA_FILE_PATH = '/etc/ssl/certs/ca-certificates.crt:'\
+        '/etc/pki/tls/certs/ca-bundle.crt:'\
+        '/etc/ssl/ca-bundle.pem:'\
+        '/etc/ssl/cert.pem'
+
+    OK_RESPONSE_CODES = (
+        httplib.OK,
+        httplib.CREATED,
+        httplib.ACCEPTED,
+        httplib.NO_CONTENT,
+    )
+
+    REDIRECT_RESPONSE_CODES = (
+        httplib.MOVED_PERMANENTLY,
+        httplib.FOUND,
+        httplib.SEE_OTHER,
+        httplib.USE_PROXY,
+        httplib.TEMPORARY_REDIRECT,
+    )
+
+    def __init__(self, host, port=None, use_ssl=False, auth_tok=None,
+                 creds=None, doc_root=None, key_file=None,
+                 cert_file=None, ca_file=None, insecure=False,
+                 configure_via_auth=True):
+>>>>>>> upstream/master
         """
         Creates a new client to some service.
 
@@ -62,6 +254,32 @@ class BaseClient(object):
         :param auth_tok: The auth token to pass to the server
         :param creds: The credentials to pass to the auth plugin
         :param doc_root: Prefix for all URLs we request from host
+<<<<<<< HEAD
+=======
+        :param key_file: Optional PEM-formatted file that contains the private
+                         key.
+                         If use_ssl is True, and this param is None (the
+                         default), then an environ variable
+                         GLANCE_CLIENT_KEY_FILE is looked for. If no such
+                         environ variable is found, ClientConnectionError
+                         will be raised.
+        :param cert_file: Optional PEM-formatted certificate chain file.
+                          If use_ssl is True, and this param is None (the
+                          default), then an environ variable
+                          GLANCE_CLIENT_CERT_FILE is looked for. If no such
+                          environ variable is found, ClientConnectionError
+                          will be raised.
+        :param ca_file: Optional CA cert file to use in SSL connections
+                        If use_ssl is True, and this param is None (the
+                        default), then an environ variable
+                        GLANCE_CLIENT_CA_FILE is looked for.
+        :param insecure: Optional. If set then the server's certificate
+                         will not be verified.
+        :param configure_via_auth: Optional. Defaults to True. If set, the
+                         URL returned from the service catalog for the image
+                         endpoint will **override** the URL supplied to in
+                         the host parameter.
+>>>>>>> upstream/master
         """
         self.host = host
         self.port = port or self.DEFAULT_PORT
@@ -69,8 +287,81 @@ class BaseClient(object):
         self.auth_tok = auth_tok
         self.creds = creds or {}
         self.connection = None
+<<<<<<< HEAD
         self.doc_root = self.DEFAULT_DOC_ROOT if doc_root is None else doc_root
         self.auth_plugin = self.make_auth_plugin(self.creds)
+=======
+        self.configure_via_auth = configure_via_auth
+        # doc_root can be a nullstring, which is valid, and why we
+        # cannot simply do doc_root or self.DEFAULT_DOC_ROOT below.
+        self.doc_root = (doc_root if doc_root is not None
+                         else self.DEFAULT_DOC_ROOT)
+        self.auth_plugin = self.make_auth_plugin(self.creds)
+
+        self.key_file = key_file
+        self.cert_file = cert_file
+        self.ca_file = ca_file
+        self.insecure = insecure
+        self.connect_kwargs = self.get_connect_kwargs()
+
+    def get_connect_kwargs(self):
+        connect_kwargs = {}
+        if self.use_ssl:
+            if self.key_file is None:
+                self.key_file = os.environ.get('GLANCE_CLIENT_KEY_FILE')
+            if self.cert_file is None:
+                self.cert_file = os.environ.get('GLANCE_CLIENT_CERT_FILE')
+            if self.ca_file is None:
+                self.ca_file = os.environ.get('GLANCE_CLIENT_CA_FILE')
+
+            # Check that key_file/cert_file are either both set or both unset
+            if self.cert_file is not None and self.key_file is None:
+                msg = _("You have selected to use SSL in connecting, "
+                        "and you have supplied a cert, "
+                        "however you have failed to supply either a "
+                        "key_file parameter or set the "
+                        "GLANCE_CLIENT_KEY_FILE environ variable")
+                raise exception.ClientConnectionError(msg)
+
+            if self.key_file is not None and self.cert_file is None:
+                msg = _("You have selected to use SSL in connecting, "
+                        "and you have supplied a key, "
+                        "however you have failed to supply either a "
+                        "cert_file parameter or set the "
+                        "GLANCE_CLIENT_CERT_FILE environ variable")
+                raise exception.ClientConnectionError(msg)
+
+            if (self.key_file is not None and
+                not os.path.exists(self.key_file)):
+                msg = _("The key file you specified %s does not "
+                        "exist") % self.key_file
+                raise exception.ClientConnectionError(msg)
+            connect_kwargs['key_file'] = self.key_file
+
+            if (self.cert_file is not None and
+                not os.path.exists(self.cert_file)):
+                msg = _("The cert file you specified %s does not "
+                        "exist") % self.cert_file
+                raise exception.ClientConnectionError(msg)
+            connect_kwargs['cert_file'] = self.cert_file
+
+            if (self.ca_file is not None and
+                not os.path.exists(self.ca_file)):
+                msg = _("The CA file you specified %s does not "
+                        "exist") % self.ca_file
+                raise exception.ClientConnectionError(msg)
+
+            if self.ca_file is None:
+                for ca in self.DEFAULT_CA_FILE_PATH.split(":"):
+                    if os.path.exists(ca):
+                        self.ca_file = ca
+                        break
+
+            connect_kwargs['ca_file'] = self.ca_file
+            connect_kwargs['insecure'] = self.insecure
+
+        return connect_kwargs
+>>>>>>> upstream/master
 
     def set_auth_token(self, auth_tok):
         """
@@ -95,16 +386,43 @@ class BaseClient(object):
 
             <http|https>://<host>:port/doc_root
         """
+<<<<<<< HEAD
+=======
+        LOG.debug(_("Configuring from URL: %s"), url)
+>>>>>>> upstream/master
         parsed = urlparse.urlparse(url)
         self.use_ssl = parsed.scheme == 'https'
         self.host = parsed.hostname
         self.port = parsed.port or 80
+<<<<<<< HEAD
         self.doc_root = parsed.path
 
     def make_auth_plugin(self, creds):
         strategy = creds.get('strategy', 'noauth')
         plugin_class = auth.get_plugin_from_strategy(strategy)
         plugin = plugin_class(creds)
+=======
+        self.doc_root = parsed.path.rstrip('/')
+
+        # We need to ensure a version identifier is appended to the doc_root
+        if not VERSION_REGEX.match(self.doc_root):
+            if self.DEFAULT_DOC_ROOT:
+                doc_root = self.DEFAULT_DOC_ROOT.lstrip('/')
+                self.doc_root += '/' + doc_root
+                msg = _("Appending doc_root %(doc_root)s to URL %(url)s")
+                LOG.debug(msg % locals())
+
+        # ensure connection kwargs are re-evaluated after the service catalog
+        # publicURL is parsed for potential SSL usage
+        self.connect_kwargs = self.get_connect_kwargs()
+
+    def make_auth_plugin(self, creds):
+        """
+        Returns an instantiated authentication plugin.
+        """
+        strategy = creds.get('strategy', 'noauth')
+        plugin = auth.get_plugin_from_strategy(strategy, creds)
+>>>>>>> upstream/master
         return plugin
 
     def get_connection_type(self):
@@ -112,11 +430,19 @@ class BaseClient(object):
         Returns the proper connection type
         """
         if self.use_ssl:
-            return httplib.HTTPSConnection
+            return HTTPSClientAuthConnection
         else:
             return httplib.HTTPConnection
 
     def _authenticate(self, force_reauth=False):
+<<<<<<< HEAD
+=======
+        """
+        Use the authentication plugin to authenticate and set the auth token.
+
+        :param force_reauth: For re-authentication to bypass cache.
+        """
+>>>>>>> upstream/master
         auth_plugin = self.auth_plugin
 
         if not auth_plugin.is_authenticated or force_reauth:
@@ -125,9 +451,16 @@ class BaseClient(object):
         self.auth_tok = auth_plugin.auth_token
 
         management_url = auth_plugin.management_url
+<<<<<<< HEAD
         if management_url:
             self.configure_from_url(management_url)
 
+=======
+        if management_url and self.configure_via_auth:
+            self.configure_from_url(management_url)
+
+    @handle_unauthenticated
+>>>>>>> upstream/master
     def do_request(self, method, action, body=None, headers=None,
                    params=None):
         headers = headers or {}
@@ -149,35 +482,70 @@ class BaseClient(object):
     def _do_request(self, method, action, body=None, headers=None,
                    params=None):
         """
+        Make a request, returning an HTTP response object.
+
+        :param method: HTTP verb (GET, POST, PUT, etc.)
+        :param action: Requested path to append to self.doc_root
+        :param body: Data to send in the body of the request
+        :param headers: Headers to send with the request
+        :param params: Key/value pairs to use in query string
+        :returns: HTTP response object
+        """
+        if not self.auth_tok:
+            self._authenticate()
+
+        url = self._construct_url(action, params)
+        return self._do_request(method=method, url=url, body=body,
+                                headers=headers)
+
+    def _construct_url(self, action, params=None):
+        """
+        Create a URL object we can use to pass to _do_request().
+        """
+        path = '/'.join([self.doc_root or '', action.lstrip('/')])
+        scheme = "https" if self.use_ssl else "http"
+        netloc = "%s:%d" % (self.host, self.port)
+
+        if isinstance(params, dict):
+            for (key, value) in params.items():
+                if value is None:
+                    del params[key]
+            query = urllib.urlencode(params)
+        else:
+            query = None
+
+        url = urlparse.ParseResult(scheme, netloc, path, '', query, '')
+        log_msg = _("Constructed URL: %s")
+        LOG.debug(log_msg, url.geturl())
+        return url
+
+    @handle_redirects
+    def _do_request(self, method, url, body, headers):
+        """
         Connects to the server and issues a request.  Handles converting
         any returned HTTP error status codes to OpenStack/Glance exceptions
         and closing the server connection. Returns the result data, or
         raises an appropriate exception.
 
         :param method: HTTP method ("GET", "POST", "PUT", etc...)
-        :param action: part of URL after root netloc
-        :param body: string of data to send, or None (default)
+        :param url: urlparse.ParsedResult object with URL information
+        :param body: data to send (as string, filelike or iterable),
+                     or None (default)
         :param headers: mapping of key/value pairs to add as headers
-        :param params: dictionary of key/value pairs to add to append
-                             to action
 
         :note
 
         If the body param has a read attribute, and method is either
         POST or PUT, this method will automatically conduct a chunked-transfer
-        encoding and use the body as a file object, transferring chunks
-        of data using the connection's send() method. This allows large
+        encoding and use the body as a file object or iterable, transferring
+        chunks of data using the connection's send() method. This allows large
         objects to be transferred efficiently without buffering the entire
         body in memory.
         """
-        if type(params) is dict:
-
-            # remove any params that are None
-            for (key, value) in params.items():
-                if value is None:
-                    del params[key]
-
-            action += '?' + urllib.urlencode(params)
+        if url.query:
+            path = url.path + "?" + url.query
+        else:
+            path = url.path
 
         try:
             connection_type = self.get_connection_type()
@@ -186,18 +554,48 @@ class BaseClient(object):
             if 'x-auth-token' not in headers and self.auth_tok:
                 headers['x-auth-token'] = self.auth_tok
 
+<<<<<<< HEAD
             c = connection_type(self.host, self.port)
+=======
+            c = connection_type(url.hostname, url.port, **self.connect_kwargs)
+
+            def _pushing(method):
+                return method.lower() in ('post', 'put')
+
+            def _simple(body):
+                return body is None or isinstance(body, basestring)
+
+            def _filelike(body):
+                return hasattr(body, 'read')
+
+            def _sendbody(connection, iter):
+                connection.endheaders()
+                for sent in iter:
+                    # iterator has done the heavy lifting
+                    pass
+
+            def _chunkbody(connection, iter):
+                connection.putheader('Transfer-Encoding', 'chunked')
+                connection.endheaders()
+                for chunk in iter:
+                    connection.send('%x\r\n%s\r\n' % (len(chunk), chunk))
+                connection.send('0\r\n\r\n')
+>>>>>>> upstream/master
 
             if self.doc_root:
                 action = '/'.join([self.doc_root, action.lstrip('/')])
 
             # Do a simple request or a chunked request, depending
-            # on whether the body param is a file-like object and
+            # on whether the body param is file-like or iterable and
             # the method is PUT or POST
-            if hasattr(body, 'read') and method.lower() in ('post', 'put'):
-                # Chunk it, baby...
-                c.putrequest(method, action)
+            #
+            if not _pushing(method) or _simple(body):
+                # Simple request...
+                c.request(method, path, body, headers)
+            elif _filelike(body) or self._iterable(body):
+                c.putrequest(method, path)
 
+<<<<<<< HEAD
                 # According to HTTP/1.1, Content-Length and Transfer-Encoding
                 # conflict.
                 for header, value in headers.items():
@@ -212,20 +610,41 @@ class BaseClient(object):
                     c.send('%x\r\n%s\r\n' % (len(chunk), chunk))
                     chunk = body.read(self.CHUNKSIZE)
                 c.send('0\r\n\r\n')
+=======
+                use_sendfile = self._sendable(body)
+
+                # According to HTTP/1.1, Content-Length and Transfer-Encoding
+                # conflict.
+                for header, value in headers.items():
+                    if use_sendfile or header.lower() != 'content-length':
+                        c.putheader(header, value)
+
+                iter = self.image_iterator(c, headers, body)
+
+                if use_sendfile:
+                    # send actual file without copying into userspace
+                    _sendbody(c, iter)
+                else:
+                    # otherwise iterate and chunk
+                    _chunkbody(c, iter)
+>>>>>>> upstream/master
             else:
-                # Simple request...
-                c.request(method, action, body, headers)
+                raise TypeError('Unsupported image type: %s' % body.__class__)
+
             res = c.getresponse()
+
+            def _retry(res):
+                return res.getheader('Retry-After')
+
             status_code = self.get_status_code(res)
-            if status_code in (httplib.OK,
-                               httplib.CREATED,
-                               httplib.ACCEPTED,
-                               httplib.NO_CONTENT):
+            if status_code in self.OK_RESPONSE_CODES:
                 return res
+            elif status_code in self.REDIRECT_RESPONSE_CODES:
+                raise exception.RedirectException(res.getheader('Location'))
             elif status_code == httplib.UNAUTHORIZED:
-                raise exception.NotAuthorized(res.read())
+                raise exception.NotAuthenticated(res.read())
             elif status_code == httplib.FORBIDDEN:
-                raise exception.NotAuthorized(res.read())
+                raise exception.Forbidden(res.read())
             elif status_code == httplib.NOT_FOUND:
                 raise exception.NotFound(res.read())
             elif status_code == httplib.CONFLICT:
@@ -234,14 +653,49 @@ class BaseClient(object):
                 raise exception.Invalid(res.read())
             elif status_code == httplib.MULTIPLE_CHOICES:
                 raise exception.MultipleChoices(body=res.read())
+<<<<<<< HEAD
+=======
+            elif status_code == httplib.REQUEST_ENTITY_TOO_LARGE:
+                raise exception.LimitExceeded(retry=_retry(res),
+                                              body=res.read())
+>>>>>>> upstream/master
             elif status_code == httplib.INTERNAL_SERVER_ERROR:
-                raise Exception("Internal Server error: %s" % res.read())
+                raise exception.ServerError(body=res.read())
+            elif status_code == httplib.SERVICE_UNAVAILABLE:
+                raise exception.ServiceUnavailable(retry=_retry(res))
             else:
-                raise Exception("Unknown error occurred! %s" % res.read())
+                raise exception.UnexpectedStatus(status=status_code,
+                                                 body=res.read())
 
         except (socket.error, IOError), e:
-            raise exception.ClientConnectionError("Unable to connect to "
-                                                  "server. Got error: %s" % e)
+            raise exception.ClientConnectionError(e)
+
+    def _seekable(self, body):
+        # pipes are not seekable, avoids sendfile() failure on e.g.
+        #   cat /path/to/image | glance add ...
+        # or where add command is launched via popen
+        try:
+            os.lseek(body.fileno(), 0, os.SEEK_SET)
+            return True
+        except OSError as e:
+            return (e.errno != errno.ESPIPE)
+
+    def _sendable(self, body):
+        return (SENDFILE_SUPPORTED      and
+                hasattr(body, 'fileno') and
+                self._seekable(body)    and
+                not self.use_ssl)
+
+    def _iterable(self, body):
+        return isinstance(body, collections.Iterable)
+
+    def image_iterator(self, connection, headers, body):
+        if self._sendable(body):
+            return SendFileIterator(connection, body)
+        elif self._iterable(body):
+            return utils.chunkreadable(body)
+        else:
+            return ImageBodyIterator(body)
 
     def get_status_code(self, response):
         """

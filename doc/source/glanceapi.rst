@@ -39,7 +39,7 @@ this list of available *public* images. The data is returned as a JSON-encoded
 mapping in the following format::
 
   {'images': [
-    {'uri': 'http://glance.example.com/images/1',
+    {'uri': 'http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9',
      'name': 'Ubuntu 10.04 Plain',
      'disk_format': 'vhd',
      'container_format': 'ovf',
@@ -62,7 +62,7 @@ retrieve this list of available *public* images. The data is returned as a
 JSON-encoded mapping in the following format::
 
   {'images': [
-    {'uri': 'http://glance.example.com/images/1',
+    {'uri': 'http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9',
      'name': 'Ubuntu 10.04 Plain 5GB',
      'disk_format': 'vhd',
      'container_format': 'ovf',
@@ -172,16 +172,17 @@ Continuing the example from above, in order to get metadata about the
 first public image returned, we can issue a ``HEAD`` request to the Glance
 server for the image's URI.
 
-We issue a ``HEAD`` request to ``http://glance.example.com/images/1`` to
+We issue a ``HEAD`` request to
+``http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9`` to
 retrieve complete metadata for that image. The metadata is returned as a
 set of HTTP headers that begin with the prefix ``x-image-meta-``. The
 following shows an example of the HTTP headers returned from the above
 ``HEAD`` request::
 
-  x-image-meta-uri              http://glance.example.com/images/1
+  x-image-meta-uri              http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9
   x-image-meta-name             Ubuntu 10.04 Plain 5GB
-  x-image-meta-disk-format      vhd
-  x-image-meta-container-format ovf
+  x-image-meta-disk_format      vhd
+  x-image-meta-container_format ovf
   x-image-meta-size             5368709120
   x-image-meta-checksum         c2e5db72bd7fd153f53ede5da5a06de3
   x-image-meta-created_at       2010-02-03 09:34:01
@@ -232,7 +233,8 @@ Continuing the example from above, in order to get metadata about the
 first public image returned, we can issue a ``HEAD`` request to the Glance
 server for the image's URI.
 
-We issue a ``GET`` request to ``http://glance.example.com/images/1`` to
+We issue a ``GET`` request to
+``http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9`` to
 retrieve metadata for that image as well as the image itself encoded
 into the response body.
 
@@ -240,10 +242,10 @@ The metadata is returned as a set of HTTP headers that begin with the
 prefix ``x-image-meta-``. The following shows an example of the HTTP headers
 returned from the above ``GET`` request::
 
-  x-image-meta-uri              http://glance.example.com/images/1
+  x-image-meta-uri              http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9
   x-image-meta-name             Ubuntu 10.04 Plain 5GB
-  x-image-meta-disk-format      vhd
-  x-image-meta-container-format ovf
+  x-image-meta-disk_format      vhd
+  x-image-meta-container_format ovf
   x-image-meta-size             5368709120
   x-image-meta-checksum         c2e5db72bd7fd153f53ede5da5a06de3
   x-image-meta-created_at       2010-02-03 09:34:01
@@ -331,7 +333,9 @@ The list of metadata headers that Glance accepts are listed below.
 
   When present, Glance will use the supplied identifier for the image.
   If the identifier already exists in that Glance node, then a
-  **409 Conflict** will be returned by Glance.
+  **409 Conflict** will be returned by Glance. The value of the header
+  must be a uuid in hexadecimal string notation
+  (i.e. 71c675ab-d94f-49cd-a114-e12490b328d9).
 
   When this header is *not* present, Glance will generate an identifier
   for the image and return this identifier in the response (see below)
@@ -349,14 +353,14 @@ The list of metadata headers that Glance accepts are listed below.
   store that is marked default. See the configuration option ``default_store``
   for more information.
 
-* ``x-image-meta-disk-format``
+* ``x-image-meta-disk_format``
 
   This header is optional. Valid values are one of ``aki``, ``ari``, ``ami``,
   ``raw``, ``iso``, ``vhd``, ``vdi``, ``qcow2``, or ``vmdk``.
 
   For more information, see :doc:`About Disk and Container Formats <formats>`
 
-* ``x-image-meta-container-format``
+* ``x-image-meta-container_format``
 
   This header is optional. Valid values are one of ``aki``, ``ari``, ``ami``,
   ``bare``, or ``ovf``.
@@ -381,7 +385,7 @@ The list of metadata headers that Glance accepts are listed below.
   checksum of the image file data.
 
   When present, Glance will verify the checksum generated from the backend
-  store when storing your image against this value and return a 
+  store when storing your image against this value and return a
   **400 Bad Request** if the values do not match.
 
 * ``x-image-meta-is-public``
@@ -468,8 +472,9 @@ append ``/members`` to it, and issue a ``GET`` request on the resulting URL.
 
 Continuing from the example above, in order to get the memberships for the
 first public image returned, we can issue a ``GET`` request to the Glance
-server for ``http://glance.example.com/images/1/members``.  What we will
-get back is JSON data such as the following::
+server for
+``http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9/members``
+.  What we will get back is JSON data such as the following::
 
   {'members': [
    {'member_id': 'tenant1',
@@ -489,7 +494,7 @@ a ``GET`` request to ``http://glance.example.com/shared-images/tenant1``.  We
 will get back JSON data such as the following::
 
   {'shared_images': [
-   {'image_id': 1,
+   {'image_id': '71c675ab-d94f-49cd-a114-e12490b328d9',
     'can_share': false}
    ...]}
 
@@ -502,10 +507,11 @@ Adding a Member to an Image
 ---------------------------
 
 We want to authorize a tenant to access a private image.  We issue a ``PUT``
-request to ``http://glance.example.com/images/1/members/tenant1``.  With no
-body, this will add the membership to the image, leaving existing memberships
-unmodified and defaulting new memberships to have `can_share` set to `false`.
-We may also optionally attach a body of the following form::
+request to
+``http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9/members/tenant1``
+.  With no body, this will add the membership to the image, leaving existing
+memberships unmodified and defaulting new memberships to have `can_share`
+set to `false`. We may also optionally attach a body of the following form::
 
   {'member':
    {'can_share': true}
@@ -528,8 +534,9 @@ Replacing a Membership List for an Image
 ----------------------------------------
 
 The full membership list for a given image may be replaced.  We issue a ``PUT``
-request to ``http://glance.example.com/images/1/members`` with a body of the
-following form::
+request to
+``http://glance.example.com/images/71c675ab-d94f-49cd-a114-e12490b328d9/members``
+with a body of the following form::
 
   {'memberships': [
    {'member_id': 'tenant1',

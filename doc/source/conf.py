@@ -18,7 +18,7 @@
 # Glance documentation build configuration file, created by
 # sphinx-quickstart on Tue May 18 13:50:15 2010.
 #
-# This file is execfile()'d with the current directory set to it's containing
+# This file is execfile()'d with the current directory set to its containing
 # dir.
 #
 # Note that not all possible configuration values are present in this
@@ -33,10 +33,10 @@ import sys
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
-sys.path.append([os.path.abspath('../glance'),
-    os.path.abspath('..'),
-    os.path.abspath('../bin')
-    ])
+sys.path = [os.path.abspath('../../glance'),
+    os.path.abspath('../..'),
+    os.path.abspath('../../bin')
+    ] + sys.path
 
 # -- General configuration ---------------------------------------------------
 
@@ -47,10 +47,7 @@ extensions = ['sphinx.ext.autodoc',
               'sphinx.ext.ifconfig',
               'sphinx.ext.intersphinx',
               'sphinx.ext.pngmath',
-              'sphinx.ext.graphviz',
-              'sphinx.ext.todo']
-
-todo_include_todos = True
+              'sphinx.ext.graphviz']
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = []
@@ -126,11 +123,25 @@ modindex_common_prefix = ['glance.']
 # List of tuples 'sourcefile', 'target', u'title', u'Authors name', 'manual'
 
 man_pages = [
+    ('man/glance', 'glance', u'Glance CLI',
+     [u'OpenStack'], 1),
     ('man/glanceapi', 'glance-api', u'Glance API Server',
+     [u'OpenStack'], 1),
+    ('man/glancecachecleaner', 'glance-cache-cleaner', u'Glance Cache Cleaner',
+     [u'OpenStack'], 1),
+    ('man/glancecachemanage', 'glance-cache-manage', u'Glance Cache Manager',
+     [u'OpenStack'], 1),
+    ('man/glancecacheprefetcher', 'glance-cache-prefetcher',
+     u'Glance Cache Pre-fetcher', [u'OpenStack'], 1),
+    ('man/glancecachepruner', 'glance-cache-pruner', u'Glance Cache Pruner',
+     [u'OpenStack'], 1),
+    ('man/glancecontrol', 'glance-control', u'Glance Daemon Control Helper ',
+     [u'OpenStack'], 1),
+    ('man/glancemanage', 'glance-manage', u'Glance Management Utility',
      [u'OpenStack'], 1),
     ('man/glanceregistry', 'glance-registry', u'Glance Registry Server',
      [u'OpenStack'], 1),
-    ('man/glancemanage', 'glance-manage', u'Glance Management Utility',
+    ('man/glancescrubber', 'glance-scrubber', u'Glance Scrubber Service',
      [u'OpenStack'], 1)
  ]
 
@@ -174,6 +185,8 @@ html_static_path = ['_static']
 # If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
 # using the given strftime format.
 #html_last_updated_fmt = '%b %d, %Y'
+git_cmd = "git log --pretty=format:'%ad, commit %h' --date=local -n1"
+html_last_updated_fmt = os.popen(git_cmd).read()
 
 # If true, SmartyPants will be used to convert quotes and dashes to
 # typographically correct entities.

@@ -19,68 +19,102 @@
 Controller for Image Cache Management API
 """
 
-import httplib
-import json
+import logging
 
-import webob.dec
 import webob.exc
 
+from glance.api import policy
+from glance.api.v1 import controller
 from glance.common import exception
 from glance.common import wsgi
-from glance import api
 from glance import image_cache
-from glance import registry
+
+logger = logging.getLogger(__name__)
 
 
-class Controller(api.BaseController):
+class Controller(controller.BaseController):
     """
-    A controller that produces information on the Glance API versions.
+    A controller for managing cached images.
     """
 
-    def __init__(self, options):
-        self.options = options
-        self.cache = image_cache.ImageCache(self.options)
+    def __init__(self, conf):
+        self.conf = conf
+        self.cache = image_cache.ImageCache(self.conf)
+        self.policy = policy.Enforcer(conf)
 
-    def index(self, req):
-        status = req.str_params.get('status')
-        if status == 'invalid':
-            entries = list(self.cache.invalid_entries())
-        elif status == 'incomplete':
-            entries = list(self.cache.incomplete_entries())
-        elif status == 'prefetching':
-            entries = list(self.cache.prefetch_entries())
-        else:
-            entries = list(self.cache.entries())
+    def _enforce(self, req):
+        """Authorize request against 'manage_image_cache' policy"""
+        try:
+            self.policy.enforce(req.context, 'manage_image_cache', {})
+        except exception.Forbidden:
+            raise webob.exc.HTTPForbidden()
 
-        return dict(cached_images=entries)
+    def get_cached_images(self, req):
+        """
+        GET /cached_images
 
-    def delete(self, req, id):
-        self.cache.purge(id)
+        Returns a mapping of records about cached images.
+        """
+        self._enforce(req)
+        images = self.cache.get_cached_images()
+        return dict(cached_images=images)
 
-    def delete_collection(self, req):
+    def delete_cached_image(self, req, image_id):
+        """
+        DELETE /cached_images/<IMAGE_ID>
+
+        Removes an image from the cache.
+        """
+        self._enforce(req)
+        self.cache.delete_cached_image(image_id)
+
+    def delete_cached_images(self, req):
         """
         DELETE /cached_images - Clear all active cached images
-        DELETE /cached_images?status=invalid - Reap invalid cached images
-        DELETE /cached_images?status=incomplete - Reap stalled cached images
-        """
-        status = req.str_params.get('status')
-        if status == 'invalid':
-            num_reaped = self.cache.reap_invalid()
-            return dict(num_reaped=num_reaped)
-        elif status == 'incomplete':
-            num_reaped = self.cache.reap_stalled()
-            return dict(num_reaped=num_reaped)
-        else:
-            num_purged = self.cache.clear()
-            return dict(num_purged=num_purged)
 
-    def update(self, req, id):
-        """PUT /cached_images/1 is used to prefetch an image into the cache"""
-        image_meta = self.get_active_image_meta_or_404(req, id)
-        try:
-            self.cache.queue_prefetch(image_meta)
-        except exception.Invalid, e:
-            raise webob.exc.HTTPBadRequest(explanation="%s" % e)
+        Removes all images from the cache.
+        """
+        self._enforce(req)
+        return dict(num_deleted=self.cache.delete_all_cached_images())
+
+    def get_queued_images(self, req):
+        """
+        GET /queued_images
+
+        Returns a mapping of records about queued images.
+        """
+        self._enforce(req)
+        images = self.cache.get_queued_images()
+        return dict(queued_images=images)
+
+    def queue_image(self, req, image_id):
+        """
+        PUT /queued_images/<IMAGE_ID>
+
+        Queues an image for caching. We do not check to see if
+        the image is in the registry here. That is done by the
+        prefetcher...
+        """
+        self._enforce(req)
+        self.cache.queue_image(image_id)
+
+    def delete_queued_image(self, req, image_id):
+        """
+        DELETE /queued_images/<IMAGE_ID>
+
+        Removes an image from the cache.
+        """
+        self._enforce(req)
+        self.cache.delete_queued_image(image_id)
+
+    def delete_queued_images(self, req):
+        """
+        DELETE /queued_images - Clear all active queued images
+
+        Removes all images from the cache.
+        """
+        self._enforce(req)
+        return dict(num_deleted=self.cache.delete_all_queued_images())
 
 
 class CachedImageDeserializer(wsgi.JSONRequestDeserializer):
@@ -91,15 +125,8 @@ class CachedImageSerializer(wsgi.JSONResponseSerializer):
     pass
 
 
-def create_resource(options):
+def create_resource(conf):
     """Cached Images resource factory method"""
     deserializer = CachedImageDeserializer()
     serializer = CachedImageSerializer()
-    return wsgi.Resource(Controller(options), deserializer, serializer)
-
-
-def app_factory(global_conf, **local_conf):
-    """paste.deploy app factory for creating Cached Images apps"""
-    conf = global_conf.copy()
-    conf.update(local_conf)
-    return Controller(conf)
+    return wsgi.Resource(Controller(conf), deserializer, serializer)

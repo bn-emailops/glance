@@ -19,13 +19,22 @@
 
 
 from glance.tests import functional
+<<<<<<< HEAD
 from glance.tests.utils import execute
+=======
+from glance.tests.utils import execute, depends_on_exe, skip_if_disabled
+>>>>>>> upstream/master
 
 
 class TestSqlite(functional.FunctionalTest):
     """Functional tests for sqlite-specific logic"""
 
     @functional.runs_sql
+<<<<<<< HEAD
+=======
+    @depends_on_exe('sqlite3')
+    @skip_if_disabled
+>>>>>>> upstream/master
     def test_big_int_mapping(self):
         """Ensure BigInteger not mapped to BIGINT"""
         self.cleanup()

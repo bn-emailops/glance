@@ -1,6 +1,6 @@
 # vim: tabstop=4 shiftwidth=4 softtabstop=4
 
-# Copyright 2011 OpenStack LLC.
+# Copyright 2012 OpenStack LLC.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -15,10 +15,6 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""
-Controller that returns information on the Glance API versions
-"""
-
 import httplib
 import json
 
@@ -29,48 +25,41 @@ from glance.common import wsgi
 
 class Controller(object):
 
-    """
-    A controller that produces information on the Glance API versions.
-    """
+    """A wsgi controller that reports which API versions are supported."""
 
-    def __init__(self, options):
-        self.options = options
+    def __init__(self, conf):
+        self.conf = conf
 
-    @webob.dec.wsgify
-    def __call__(self, req):
+    def index(self, req):
         """Respond to a request for all OpenStack API versions."""
-        version_objs = [
-            {
-                "id": "v1.1",
-                "status": "CURRENT",
-                "links": [
+        def build_version_object(version, path, status):
+            return {
+                'id': 'v%s' % version,
+                'status': status,
+                'links': [
                     {
-                        "rel": "self",
-                        "href": self.get_href()}]},
-            {
-                "id": "v1.0",
-                "status": "SUPPORTED",
-                "links": [
-                    {
-                        "rel": "self",
-                        "href": self.get_href()}]}]
+                        'rel': 'self',
+                        'href': '%s/%s/' % (req.host_url, path),
+                    },
+                ],
+            }
 
-        body = json.dumps(dict(versions=version_objs))
+        version_objs = [
+            build_version_object(2, 'v2', 'EXPERIMENTAL'),
+            build_version_object(1.1, 'v1', 'CURRENT'),
+            build_version_object(1.0, 'v1', 'SUPPORTED'),
+        ]
 
         response = webob.Response(request=req,
                                   status=httplib.MULTIPLE_CHOICES,
                                   content_type='application/json')
-        response.body = body
-
+        response.body = json.dumps(dict(versions=version_objs))
         return response
 
-    def get_href(self):
-        return "http://%s:%s/v1/" % (self.options['bind_host'],
-                                      self.options['bind_port'])
+    @webob.dec.wsgify(RequestClass=wsgi.Request)
+    def __call__(self, req):
+        return self.index(req)
 
 
-def app_factory(global_conf, **local_conf):
-    """paste.deploy app factory for creating Glance API versions apps"""
-    conf = global_conf.copy()
-    conf.update(local_conf)
-    return Controller(conf)
+def create_resource(conf):
+    return wsgi.Resource(Controller(conf))

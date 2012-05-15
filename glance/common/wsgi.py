@@ -21,20 +21,42 @@
 Utility methods for working with WSGI servers
 """
 
+import datetime
+import errno
 import json
 import logging
+import os
+import signal
 import sys
-import datetime
+import time
 
 import eventlet
+import eventlet.greenio
+from eventlet.green import socket, ssl
 import eventlet.wsgi
-eventlet.patcher.monkey_patch(all=False, socket=True)
+from paste import deploy
 import routes
 import routes.middleware
 import webob.dec
 import webob.exc
 
 from glance.common import exception
+from glance.common import utils
+from glance.openstack.common import cfg
+
+
+bind_opts = [
+    cfg.StrOpt('bind_host', default='0.0.0.0'),
+    cfg.IntOpt('bind_port'),
+]
+
+socket_opts = [
+    cfg.IntOpt('backlog', default=4096),
+    cfg.StrOpt('cert_file'),
+    cfg.StrOpt('key_file'),
+]
+
+workers_opt = cfg.IntOpt('workers', default=0)
 
 
 class WritableLogger(object):
@@ -48,35 +70,196 @@ class WritableLogger(object):
         self.logger.log(self.level, msg.strip("\n"))
 
 
-def run_server(application, port):
-    """Run a WSGI server with the given application."""
-    sock = eventlet.listen(('0.0.0.0', port))
-    eventlet.wsgi.server(sock, application)
+def get_bind_addr(conf, default_port=None):
+    """Return the host and port to bind to."""
+    conf.register_opts(bind_opts)
+    return (conf.bind_host, conf.bind_port or default_port)
+
+
+def get_socket(conf, default_port):
+    """
+    Bind socket to bind ip:port in conf
+
+    note: Mostly comes from Swift with a few small changes...
+
+    :param conf: a cfg.ConfigOpts object
+    :param default_port: port to bind to if none is specified in conf
+
+    :returns : a socket object as returned from socket.listen or
+               ssl.wrap_socket if conf specifies cert_file
+    """
+    bind_addr = get_bind_addr(conf, default_port)
+
+    # TODO(jaypipes): eventlet's greened socket module does not actually
+    # support IPv6 in getaddrinfo(). We need to get around this in the
+    # future or monitor upstream for a fix
+    address_family = [addr[0] for addr in socket.getaddrinfo(bind_addr[0],
+            bind_addr[1], socket.AF_UNSPEC, socket.SOCK_STREAM)
+            if addr[0] in (socket.AF_INET, socket.AF_INET6)][0]
+
+    conf.register_opts(socket_opts)
+
+    cert_file = conf.cert_file
+    key_file = conf.key_file
+    use_ssl = cert_file or key_file
+    if use_ssl and (not cert_file or not key_file):
+        raise RuntimeError(_("When running server in SSL mode, you must "
+                             "specify both a cert_file and key_file "
+                             "option value in your configuration file"))
+
+    sock = None
+    retry_until = time.time() + 30
+    while not sock and time.time() < retry_until:
+        try:
+            sock = eventlet.listen(bind_addr, backlog=conf.backlog,
+                                   family=address_family)
+            if use_ssl:
+                sock = ssl.wrap_socket(sock, certfile=cert_file,
+                                       keyfile=key_file)
+        except socket.error, err:
+            if err.args[0] != errno.EADDRINUSE:
+                raise
+            eventlet.sleep(0.1)
+    if not sock:
+        raise RuntimeError(_("Could not bind to %s:%s after trying for 30 "
+                             "seconds") % bind_addr)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # in my experience, sockets can hang around forever without keepalive
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+
+    # This option isn't available in the OS X version of eventlet
+    if hasattr(socket, 'TCP_KEEPIDLE'):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 600)
+
+    return sock
 
 
 class Server(object):
     """Server class to manage multiple WSGI sockets and applications."""
 
     def __init__(self, threads=1000):
-        self.pool = eventlet.GreenPool(threads)
+        self.threads = threads
+        self.children = []
+        self.running = True
 
-    def start(self, application, port, host='0.0.0.0', backlog=128):
-        """Run a WSGI server with the given application."""
-        socket = eventlet.listen((host, port), backlog=backlog)
-        self.pool.spawn_n(self._run, application, socket)
+    def start(self, application, conf, default_port):
+        """
+        Run a WSGI server with the given application.
+
+        :param application: The application to run in the WSGI server
+        :param conf: a cfg.ConfigOpts object
+        :param default_port: Port to bind to if none is specified in conf
+        """
+        def kill_children(*args):
+            """Kills the entire process group."""
+            self.logger.error(_('SIGTERM or SIGINT received'))
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            self.running = False
+            os.killpg(0, signal.SIGTERM)
+
+        def hup(*args):
+            """
+            Shuts down the server, but allows running requests to complete
+            """
+            self.logger.error(_('SIGHUP received'))
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            self.running = False
+
+        self.application = application
+        self.sock = get_socket(conf, default_port)
+        conf.register_opt(workers_opt)
+
+        self.logger = logging.getLogger('eventlet.wsgi.server')
+
+        if conf.workers == 0:
+            # Useful for profiling, test, debug etc.
+            self.pool = eventlet.GreenPool(size=self.threads)
+            self.pool.spawn_n(self._single_run, application, self.sock)
+            return
+
+        self.logger.info(_("Starting %d workers") % conf.workers)
+        signal.signal(signal.SIGTERM, kill_children)
+        signal.signal(signal.SIGINT, kill_children)
+        signal.signal(signal.SIGHUP, hup)
+        while len(self.children) < conf.workers:
+            self.run_child()
+
+    def wait_on_children(self):
+        while self.running:
+            try:
+                pid, status = os.wait()
+                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                    self.logger.error(_('Removing dead child %s') % pid)
+                    self.children.remove(pid)
+                    if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 2:
+                        self.logger.error(_('Not respawning child %d, cannot '
+                                            'recover from termination') % pid)
+                        if not self.children:
+                            self.logger.error(
+                                _('All workers have terminated. Exiting'))
+                            self.running = False
+                    else:
+                        self.run_child()
+            except OSError, err:
+                if err.errno not in (errno.EINTR, errno.ECHILD):
+                    raise
+            except KeyboardInterrupt:
+                self.logger.info(_('Caught keyboard interrupt. Exiting.'))
+                break
+        eventlet.greenio.shutdown_safe(self.sock)
+        self.sock.close()
+        self.logger.debug(_('Exited'))
 
     def wait(self):
         """Wait until all servers have completed running."""
         try:
-            self.pool.waitall()
+            if self.children:
+                self.wait_on_children()
+            else:
+                self.pool.waitall()
         except KeyboardInterrupt:
             pass
 
-    def _run(self, application, socket):
+    def run_child(self):
+        pid = os.fork()
+        if pid == 0:
+            signal.signal(signal.SIGHUP, signal.SIG_DFL)
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            # ignore the interrupt signal to avoid a race whereby
+            # a child worker receives the signal before the parent
+            # and is respawned unneccessarily as a result
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+            self.run_server()
+            self.logger.info(_('Child %d exiting normally') % os.getpid())
+            return
+        else:
+            self.logger.info(_('Started child %s') % pid)
+            self.children.append(pid)
+
+    def run_server(self):
+        """Run a WSGI server."""
+        eventlet.wsgi.HttpProtocol.default_request_version = "HTTP/1.0"
+        try:
+            eventlet.hubs.use_hub('poll')
+        except Exception:
+            msg = _("eventlet 'poll' hub is not available on this platform")
+            raise exception.WorkerCreationFailure(reason=msg)
+        eventlet.patcher.monkey_patch(all=False, socket=True)
+        self.pool = eventlet.GreenPool(size=self.threads)
+        try:
+            eventlet.wsgi.server(self.sock, self.application,
+                    log=WritableLogger(self.logger), custom_pool=self.pool)
+        except socket.error, err:
+            if err[0] != errno.EINVAL:
+                raise
+        self.pool.waitall()
+
+    def _single_run(self, application, sock):
         """Start a WSGI server in a new green thread."""
-        logger = logging.getLogger('eventlet.wsgi.server')
-        eventlet.wsgi.server(socket, application, custom_pool=self.pool,
-                             log=WritableLogger(logger))
+        self.logger.info(_("Starting single process server"))
+        eventlet.wsgi.server(sock, application, custom_pool=self.pool,
+                             log=WritableLogger(self.logger))
 
 
 class Middleware(object):
@@ -264,7 +447,7 @@ class JSONResponseSerializer(object):
         return json.dumps(data, default=sanitizer)
 
     def default(self, response, result):
-        response.headers.add('Content-Type', 'application/json')
+        response.content_type = 'application/json'
         response.body = self.to_json(result)
 
 
@@ -285,7 +468,7 @@ class Resource(object):
     may raise a webob.exc exception or return a dict, which will be
     serialized by requested content type.
     """
-    def __init__(self, controller, deserializer, serializer):
+    def __init__(self, controller, deserializer=None, serializer=None):
         """
         :param controller: object that implement methods created by routes lib
         :param deserializer: object that supports webob request deserialization
@@ -294,8 +477,8 @@ class Resource(object):
                            through controller-like actions
         """
         self.controller = controller
-        self.serializer = serializer
-        self.deserializer = deserializer
+        self.serializer = serializer or JSONResponseSerializer()
+        self.deserializer = deserializer or JSONRequestDeserializer()
 
     @webob.dec.wsgify(RequestClass=Request)
     def __call__(self, request):
@@ -310,7 +493,7 @@ class Resource(object):
         action_result = self.dispatch(self.controller, action,
                                       request, **action_args)
         try:
-            response = webob.Response()
+            response = webob.Response(request=request)
             self.dispatch(self.serializer, action, response, action_result)
             return response
 
@@ -345,3 +528,139 @@ class Resource(object):
             pass
 
         return args
+
+
+class BasePasteFactory(object):
+
+    """A base class for paste app and filter factories.
+
+    Sub-classes must override the KEY class attribute and provide
+    a __call__ method.
+    """
+
+    KEY = None
+
+    def __init__(self, conf):
+        self.conf = conf
+
+    def __call__(self, global_conf, **local_conf):
+        raise NotImplementedError
+
+    def _import_factory(self, local_conf):
+        """Import an app/filter class.
+
+        Lookup the KEY from the PasteDeploy local conf and import the
+        class named therein. This class can then be used as an app or
+        filter factory.
+
+        Note we support the <module>:<class> format.
+
+        Note also that if you do e.g.
+
+          key =
+              value
+
+        then ConfigParser returns a value with a leading newline, so
+        we strip() the value before using it.
+        """
+        class_name = local_conf[self.KEY].replace(':', '.').strip()
+        return utils.import_class(class_name)
+
+
+class AppFactory(BasePasteFactory):
+
+    """A Generic paste.deploy app factory.
+
+    This requires glance.app_factory to be set to a callable which returns a
+    WSGI app when invoked. The format of the name is <module>:<callable> e.g.
+
+      [app:apiv1app]
+      paste.app_factory = glance.common.wsgi:app_factory
+      glance.app_factory = glance.api.v1:API
+
+    The WSGI app constructor must accept a ConfigOpts object and a local config
+    dict as its two arguments.
+    """
+
+    KEY = 'glance.app_factory'
+
+    def __call__(self, global_conf, **local_conf):
+        """The actual paste.app_factory protocol method."""
+        factory = self._import_factory(local_conf)
+        return factory(self.conf, **local_conf)
+
+
+class FilterFactory(AppFactory):
+
+    """A Generic paste.deploy filter factory.
+
+    This requires glance.filter_factory to be set to a callable which returns a
+    WSGI filter when invoked. The format is <module>:<callable> e.g.
+
+      [filter:cache]
+      paste.filter_factory = glance.common.wsgi:filter_factory
+      glance.filter_factory = glance.api.middleware.cache:CacheFilter
+
+    The WSGI filter constructor must accept a WSGI app, a ConfigOpts object and
+    a local config dict as its three arguments.
+    """
+
+    KEY = 'glance.filter_factory'
+
+    def __call__(self, global_conf, **local_conf):
+        """The actual paste.filter_factory protocol method."""
+        factory = self._import_factory(local_conf)
+
+        def filter(app):
+            return factory(app, self.conf, **local_conf)
+
+        return filter
+
+
+def setup_paste_factories(conf):
+    """Set up the generic paste app and filter factories.
+
+    Set things up so that:
+
+      paste.app_factory = glance.common.wsgi:app_factory
+
+    and
+
+      paste.filter_factory = glance.common.wsgi:filter_factory
+
+    work correctly while loading PasteDeploy configuration.
+
+    The app factories are constructed at runtime to allow us to pass a
+    ConfigOpts object to the WSGI classes.
+
+    :param conf: a ConfigOpts object
+    """
+    global app_factory, filter_factory
+    app_factory = AppFactory(conf)
+    filter_factory = FilterFactory(conf)
+
+
+def teardown_paste_factories():
+    """Reverse the effect of setup_paste_factories()."""
+    global app_factory, filter_factory
+    del app_factory
+    del filter_factory
+
+
+def paste_deploy_app(paste_config_file, app_name, conf):
+    """Load a WSGI app from a PasteDeploy configuration.
+
+    Use deploy.loadapp() to load the app from the PasteDeploy configuration,
+    ensuring that the supplied ConfigOpts object is passed to the app and
+    filter constructors.
+
+    :param paste_config_file: a PasteDeploy config file
+    :param app_name: the name of the app/pipeline to load from the file
+    :param conf: a ConfigOpts object to supply to the app and its filters
+    :returns: the WSGI app
+    """
+    setup_paste_factories(conf)
+    try:
+        return deploy.loadapp("config:%s" % paste_config_file, name=app_name)
+    finally:
+        teardown_paste_factories()

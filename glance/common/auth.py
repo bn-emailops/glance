@@ -30,6 +30,7 @@ Keystone (an identity management system).
     > auth_plugin.management_url
     http://service_endpoint/
 """
+<<<<<<< HEAD
 import httplib2
 import json
 import urlparse
@@ -45,6 +46,24 @@ class BaseStrategy(object):
         # TODO(sirp): For now we're just dealing with one endpoint, eventually
         # this should expose the entire service catalog so that the client can
         # choose which service/region/(public/private net) combo they want.
+=======
+import json
+import logging
+import urlparse
+
+import httplib2
+
+from glance.common import exception
+
+
+logger = logging.getLogger('glance.common.auth')
+
+
+class BaseStrategy(object):
+    def __init__(self):
+        self.auth_token = None
+        # TODO(sirp): Should expose selecting public/internal/admin URL.
+>>>>>>> upstream/master
         self.management_url = None
 
     def authenticate(self):
@@ -54,6 +73,13 @@ class BaseStrategy(object):
     def is_authenticated(self):
         raise NotImplementedError
 
+<<<<<<< HEAD
+=======
+    @property
+    def strategy(self):
+        raise NotImplementedError
+
+>>>>>>> upstream/master
 
 class NoAuthStrategy(BaseStrategy):
     def authenticate(self):
@@ -63,10 +89,38 @@ class NoAuthStrategy(BaseStrategy):
     def is_authenticated(self):
         return True
 
+<<<<<<< HEAD
+=======
+    @property
+    def strategy(self):
+        return 'noauth'
+
+>>>>>>> upstream/master
 
 class KeystoneStrategy(BaseStrategy):
     MAX_REDIRECTS = 10
 
+<<<<<<< HEAD
+=======
+    def __init__(self, creds):
+        self.creds = creds
+        super(KeystoneStrategy, self).__init__()
+
+    def check_auth_params(self):
+        # Ensure that supplied credential parameters are as required
+        for required in ('username', 'password', 'auth_url',
+                         'strategy'):
+            if required not in self.creds:
+                raise exception.MissingCredentialError(required=required)
+        if self.creds['strategy'] != 'keystone':
+            raise exception.BadAuthStrategy(expected='keystone',
+                                            received=self.creds['strategy'])
+        # For v2.0 also check tenant is present
+        if self.creds['auth_url'].rstrip('/').endswith('v2.0'):
+            if 'tenant' not in self.creds:
+                raise exception.MissingCredentialError(required='tenant')
+
+>>>>>>> upstream/master
     def authenticate(self):
         """Authenticate with the Keystone service.
 
@@ -82,6 +136,7 @@ class KeystoneStrategy(BaseStrategy):
            case, we rewrite the url to contain /v2.0/ and retry using the v2
            protocol.
         """
+<<<<<<< HEAD
         def check_auth_params():
             # Ensure that supplied credential parameters are as required
             for required in ('username', 'password', 'auth_url'):
@@ -92,6 +147,8 @@ class KeystoneStrategy(BaseStrategy):
                 if 'tenant' not in self.creds:
                     raise exception.MissingCredentialError(required='tenant')
 
+=======
+>>>>>>> upstream/master
         def _authenticate(auth_url):
             # If OS_AUTH_URL is missing a trailing slash add one
             if not auth_url.endswith('/'):
@@ -104,12 +161,20 @@ class KeystoneStrategy(BaseStrategy):
             else:
                 self._v1_auth(token_url)
 
+<<<<<<< HEAD
         check_auth_params()
+=======
+        self.check_auth_params()
+>>>>>>> upstream/master
         auth_url = self.creds['auth_url']
         for _ in range(self.MAX_REDIRECTS):
             try:
                 _authenticate(auth_url)
+<<<<<<< HEAD
             except exception.RedirectException as e:
+=======
+            except exception.AuthorizationRedirect as e:
+>>>>>>> upstream/master
                 # 2. Keystone may redirect us
                 auth_url = e.url
             except exception.AuthorizationFailure:
@@ -125,7 +190,11 @@ class KeystoneStrategy(BaseStrategy):
                 break
         else:
             # Guard against a redirection loop
+<<<<<<< HEAD
             raise Exception(_("Exceeded max redirects %s") % MAX_REDIRECTS)
+=======
+            raise exception.MaxRedirectsExceeded(redirects=self.MAX_REDIRECTS)
+>>>>>>> upstream/master
 
     def _v1_auth(self, token_url):
         creds = self.creds
@@ -140,24 +209,84 @@ class KeystoneStrategy(BaseStrategy):
 
         resp, resp_body = self._do_request(token_url, 'GET', headers=headers)
 
+<<<<<<< HEAD
         if resp.status in (200, 204):
             try:
                 self.management_url = resp['x-server-management-url']
+=======
+        def _management_url(self, resp):
+            for url_header in ('x-image-management-url',
+                               'x-server-management-url',
+                               'x-glance'):
+                try:
+                    return resp[url_header]
+                except KeyError as e:
+                    not_found = e
+            raise not_found
+
+        if resp.status in (200, 204):
+            try:
+                self.management_url = _management_url(self, resp)
+>>>>>>> upstream/master
                 self.auth_token = resp['x-auth-token']
             except KeyError:
                 raise exception.AuthorizationFailure()
         elif resp.status == 305:
+<<<<<<< HEAD
             raise exception.RedirectException(resp['location'])
         elif resp.status == 400:
             raise exception.AuthBadRequest()
         elif resp.status == 401:
             raise exception.NotAuthorized()
+=======
+            raise exception.AuthorizationRedirect(resp['location'])
+        elif resp.status == 400:
+            raise exception.AuthBadRequest(url=token_url)
+        elif resp.status == 401:
+            raise exception.NotAuthenticated()
+>>>>>>> upstream/master
         elif resp.status == 404:
             raise exception.AuthUrlNotFound(url=token_url)
         else:
             raise Exception(_('Unexpected response: %s' % resp.status))
 
     def _v2_auth(self, token_url):
+<<<<<<< HEAD
+=======
+        def get_endpoint(service_catalog):
+            """
+            Select an endpoint from the service catalog
+
+            We search the full service catalog for services
+            matching both type and region. If the client
+            supplied no region then any 'image' endpoint
+            is considered a match. There must be one -- and
+            only one -- successful match in the catalog,
+            otherwise we will raise an exception.
+            """
+            # FIXME(sirp): for now just use the public url.
+            endpoint = None
+            region = self.creds.get('region')
+            for service in service_catalog:
+                try:
+                    service_type = service['type']
+                except KeyError:
+                    msg = _('Encountered service with no "type": %s' % service)
+                    logger.warn(msg)
+                    continue
+
+                if service_type == 'image':
+                    for ep in service['endpoints']:
+                        if region is None or region == ep['region']:
+                            if endpoint is not None:
+                                # This is a second match, abort
+                                raise exception.RegionAmbiguity(region=region)
+                            endpoint = ep
+            if endpoint is None:
+                raise exception.NoServiceEndpoint()
+            return endpoint['publicURL']
+
+>>>>>>> upstream/master
         creds = self.creds
 
         creds = {
@@ -179,6 +308,7 @@ class KeystoneStrategy(BaseStrategy):
 
         if resp.status == 200:
             resp_auth = json.loads(resp_body)['access']
+<<<<<<< HEAD
 
             # FIXME(sirp): for now just using the first endpoint we get back
             # from the service catalog for glance, and using the public url.
@@ -197,6 +327,16 @@ class KeystoneStrategy(BaseStrategy):
             raise exception.AuthBadRequest()
         elif resp.status == 401:
             raise exception.NotAuthorized()
+=======
+            self.management_url = get_endpoint(resp_auth['serviceCatalog'])
+            self.auth_token = resp_auth['token']['id']
+        elif resp.status == 305:
+            raise exception.RedirectException(resp['location'])
+        elif resp.status == 400:
+            raise exception.AuthBadRequest(url=token_url)
+        elif resp.status == 401:
+            raise exception.NotAuthenticated()
+>>>>>>> upstream/master
         elif resp.status == 404:
             raise exception.AuthUrlNotFound(url=token_url)
         else:
@@ -206,6 +346,13 @@ class KeystoneStrategy(BaseStrategy):
     def is_authenticated(self):
         return self.auth_token is not None
 
+<<<<<<< HEAD
+=======
+    @property
+    def strategy(self):
+        return 'keystone'
+
+>>>>>>> upstream/master
     @staticmethod
     def _do_request(url, method, headers=None, body=None):
         headers = headers or {}
@@ -216,10 +363,18 @@ class KeystoneStrategy(BaseStrategy):
         return resp, resp_body
 
 
+<<<<<<< HEAD
 def get_plugin_from_strategy(strategy):
     if strategy == 'noauth':
         return NoAuthStrategy
     elif strategy == 'keystone':
         return KeystoneStrategy
+=======
+def get_plugin_from_strategy(strategy, creds=None):
+    if strategy == 'noauth':
+        return NoAuthStrategy()
+    elif strategy == 'keystone':
+        return KeystoneStrategy(creds)
+>>>>>>> upstream/master
     else:
         raise Exception(_("Unknown auth strategy '%s'") % strategy)

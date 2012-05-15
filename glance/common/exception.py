@@ -16,118 +16,14 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-"""
-Nova base exception handling, including decorator for re-raising
-Nova-type exceptions. SHOULD include dedicated exception logging.
-"""
+"""Glance exception subclasses"""
 
-import logging
-import sys
-import traceback
+import urlparse
 
 
-class ProcessExecutionError(IOError):
-    def __init__(self, stdout=None, stderr=None, exit_code=None, cmd=None,
-                 description=None):
-        if description is None:
-            description = "Unexpected error while running command."
-        if exit_code is None:
-            exit_code = '-'
-        message = _("%s\nCommand: %s\nExit code: %s\nStdout: %r\nStderr: %r")\
-                    % (description, cmd, exit_code, stdout, stderr)
-        IOError.__init__(self, message)
-
-
-class Error(Exception):
-    def __init__(self, message=None):
-        super(Error, self).__init__(message)
-
-
-class ApiError(Error):
-    def __init__(self, message='Unknown', code='Unknown'):
-        self.message = message
-        self.code = code
-        super(ApiError, self).__init__('%s: %s' % (code, message))
-
-
-class NotFound(Error):
-    pass
-
-
-class UnknownScheme(Error):
-
-    msg = _("Unknown scheme '%s' found in URI")
-
-    def __init__(self, scheme):
-        msg = self.__class__.msg % scheme
-        super(UnknownScheme, self).__init__(msg)
-
-
-class BadStoreUri(Error):
-
-    msg = _("The Store URI %s was malformed. Reason: %s")
-
-    def __init__(self, uri, reason):
-        msg = self.__class__.msg % (uri, reason)
-        super(BadStoreUri, self).__init__(msg)
-
-
-class Duplicate(Error):
-    pass
-
-
-class AuthorizationFailure(Error):
-    pass
-
-
-class NotAuthorized(Error):
-    pass
-
-
-class NotEmpty(Error):
-    pass
-
-
-class Invalid(Error):
-    pass
-
-
-class RedirectException(Error):
+class RedirectException(Exception):
     def __init__(self, url):
-        self.url = url
-
-
-class BadInputError(Exception):
-    """Error resulting from a client sending bad input to a server"""
-    pass
-
-
-class MissingArgumentError(Error):
-    pass
-
-
-class DatabaseMigrationError(Error):
-    pass
-
-
-class ClientConnectionError(Exception):
-    """Error resulting from a client connecting to a server"""
-    pass
-
-
-def wrap_exception(f):
-    def _wrap(*args, **kw):
-        try:
-            return f(*args, **kw)
-        except Exception, e:
-            if not isinstance(e, Error):
-                #exc_type, exc_value, exc_traceback = sys.exc_info()
-                logging.exception('Uncaught exception')
-                #logging.error(traceback.extract_stack(exc_traceback))
-                raise Error("%s" % e)
-            raise
-    _wrap.func_name = f.func_name
-    return _wrap
+        self.url = urlparse.urlparse(url)
 
 
 class GlanceException(Exception):
@@ -140,16 +36,172 @@ class GlanceException(Exception):
     """
     message = _("An unknown exception occurred")
 
-    def __init__(self, **kwargs):
+    def __init__(self, *args, **kwargs):
         try:
             self._error_string = self.message % kwargs
-
         except Exception:
             # at least get the core message out if something happened
             self._error_string = self.message
+        if len(args) > 0:
+            # If there is a non-kwarg parameter, assume it's the error
+            # message or reason description and tack it on to the end
+            # of the exception message
+            # Convert all arguments into their string representations...
+            args = ["%s" % arg for arg in args]
+            self._error_string = (self._error_string +
+                                  "\nDetails: %s" % '\n'.join(args))
 
     def __str__(self):
         return self._error_string
+
+
+class MissingArgumentError(GlanceException):
+    message = _("Missing required argument.")
+
+
+class MissingCredentialError(GlanceException):
+    message = _("Missing required credential: %(required)s")
+
+
+class BadAuthStrategy(GlanceException):
+    message = _("Incorrect auth strategy, expected \"%(expected)s\" but "
+                "received \"%(received)s\"")
+
+
+class NotFound(GlanceException):
+    message = _("An object with the specified identifier was not found.")
+
+
+class UnknownScheme(GlanceException):
+    message = _("Unknown scheme '%(scheme)s' found in URI")
+
+
+class BadStoreUri(GlanceException):
+    message = _("The Store URI %(uri)s was malformed. Reason: %(reason)s")
+
+<<<<<<< HEAD
+class AuthorizationFailure(Error):
+    pass
+
+
+class NotAuthorized(Error):
+    pass
+=======
+>>>>>>> upstream/master
+
+class Duplicate(GlanceException):
+    message = _("An object with the same identifier already exists.")
+
+
+class StorageFull(GlanceException):
+    message = _("There is not enough disk space on the image storage media.")
+
+
+class StorageWriteDenied(GlanceException):
+    message = _("Permission to write image storage media denied.")
+
+<<<<<<< HEAD
+class RedirectException(Error):
+    def __init__(self, url):
+        self.url = url
+
+
+class BadInputError(Exception):
+    """Error resulting from a client sending bad input to a server"""
+    pass
+=======
+>>>>>>> upstream/master
+
+class ImportFailure(GlanceException):
+    message = _("Failed to import requested object/class: '%(import_str)s'. "
+                "Reason: %(reason)s")
+
+
+class AuthBadRequest(GlanceException):
+    message = _("Connect error/bad request to Auth service at URL %(url)s.")
+
+
+class AuthUrlNotFound(GlanceException):
+    message = _("Auth service at URL %(url)s not found.")
+
+
+class AuthorizationFailure(GlanceException):
+    message = _("Authorization failed.")
+
+
+class NotAuthenticated(GlanceException):
+    message = _("You are not authenticated.")
+
+
+class Forbidden(GlanceException):
+    message = _("You are not authorized to complete this action.")
+
+
+class ForbiddenPublicImage(Forbidden):
+    message = _("You are not authorized to complete this action.")
+
+
+#NOTE(bcwaldon): here for backwards-compatability, need to deprecate.
+class NotAuthorized(Forbidden):
+    message = _("You are not authorized to complete this action.")
+
+
+class Invalid(GlanceException):
+    message = _("Data supplied was not valid.")
+
+
+class AuthorizationRedirect(GlanceException):
+    message = _("Redirecting to %(uri)s for authorization.")
+
+
+class DatabaseMigrationError(GlanceException):
+    message = _("There was an error migrating the database.")
+
+
+class ClientConnectionError(GlanceException):
+    message = _("There was an error connecting to a server")
+
+
+class ClientConfigurationError(GlanceException):
+    message = _("There was an error configuring the client.")
+
+
+class MultipleChoices(GlanceException):
+    message = _("The request returned a 302 Multiple Choices. This generally "
+                "means that you have not included a version indicator in a "
+                "request URI.\n\nThe body of response returned:\n%(body)s")
+
+
+class LimitExceeded(GlanceException):
+    message = _("The request returned a 413 Request Entity Too Large. This "
+                "generally means that rate limiting or a quota threshold was "
+                "breached.\n\nThe response body:\n%(body)s")
+
+    def __init__(self, *args, **kwargs):
+        self.retry_after = (int(kwargs['retry']) if kwargs.get('retry')
+                            else None)
+        super(LimitExceeded, self).__init__(*args, **kwargs)
+
+
+class ServiceUnavailable(GlanceException):
+    message = _("The request returned 503 Service Unavilable. This "
+                "generally occurs on service overload or other transient "
+                "outage.")
+
+    def __init__(self, *args, **kwargs):
+        self.retry_after = (int(kwargs['retry']) if kwargs.get('retry')
+                            else None)
+        super(ServiceUnavailable, self).__init__(*args, **kwargs)
+
+
+class ServerError(GlanceException):
+    message = _("The request returned 500 Internal Server Error"
+                "\n\nThe response body:\n%(body)s")
+
+
+class UnexpectedStatus(GlanceException):
+    message = _("The request returned an unexpected status: %(status)s."
+                "\n\nThe response body:\n%(body)s")
 
 
 class MultipleChoices(GlanceException):
@@ -162,8 +214,18 @@ class InvalidContentType(GlanceException):
     message = _("Invalid content type %(content_type)s")
 
 
+class BadRegistryConnectionConfiguration(GlanceException):
+    message = _("Registry was not configured correctly on API server. "
+                "Reason: %(reason)s")
+
+
 class BadStoreConfiguration(GlanceException):
     message = _("Store %(store_name)s could not be configured correctly. "
+               "Reason: %(reason)s")
+
+
+class BadDriverConfiguration(GlanceException):
+    message = _("Driver %(driver_name)s could not be configured correctly. "
                "Reason: %(reason)s")
 
 
@@ -177,6 +239,7 @@ class StoreAddDisabled(GlanceException):
 
 
 class InvalidNotifierStrategy(GlanceException):
+<<<<<<< HEAD
     message = "'%(strategy)s' is not an available notifier strategy."
 
 
@@ -198,3 +261,32 @@ class AuthUrlNotFound(GlanceException):
 
 class AuthorizationFailure(GlanceException):
     message = _("Authorization failed.")
+=======
+    message = _("'%(strategy)s' is not an available notifier strategy.")
+
+
+class MaxRedirectsExceeded(GlanceException):
+    message = _("Maximum redirects (%(redirects)s) was exceeded.")
+
+
+class InvalidRedirect(GlanceException):
+    message = _("Received invalid HTTP redirect.")
+
+
+class NoServiceEndpoint(GlanceException):
+    message = _("Response from Keystone does not contain a Glance endpoint.")
+
+
+class RegionAmbiguity(GlanceException):
+    message = _("Multiple 'image' service matches for region %(region)s. This "
+                "generally means that a region is required and you have not "
+                "supplied one.")
+
+
+class WorkerCreationFailure(GlanceException):
+    message = _("Server worker creation failed: %(reason)s.")
+
+
+class SchemaLoadError(GlanceException):
+    message = _("Unable to load schema: %(reason)s")
+>>>>>>> upstream/master

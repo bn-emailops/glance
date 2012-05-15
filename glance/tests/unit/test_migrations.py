@@ -35,9 +35,14 @@ from sqlalchemy import *
 from sqlalchemy.pool import NullPool
 
 from glance.common import exception
+<<<<<<< HEAD
 from glance.registry.db import models
+=======
+from glance.openstack.common import cfg
+>>>>>>> upstream/master
 import glance.registry.db.migration as migration_api
-from glance.tests.utils import execute
+from glance.registry.db import models
+from glance.tests import utils
 
 
 class TestMigrations(unittest.TestCase):
@@ -88,10 +93,19 @@ class TestMigrations(unittest.TestCase):
         self._reset_databases()
 
     def _reset_databases(self):
+        def _is_sqlite(conn_string):
+            return conn_string.startswith('sqlite')
+
+        def _is_mysql(conn_string):
+            return conn_string.startswith('mysql')
+
+        def _is_postgresql(conn_string):
+            return conn_string.startswith('postgresql')
+
         for key, engine in self.engines.items():
             conn_string = TestMigrations.TEST_DATABASES[key]
             conn_pieces = urlparse.urlparse(conn_string)
-            if conn_string.startswith('sqlite'):
+            if _is_sqlite(conn_string):
                 # We can just delete the SQLite database, which is
                 # the easiest and cleanest solution
                 db_path = conn_pieces.path.strip('/')
@@ -99,7 +113,7 @@ class TestMigrations(unittest.TestCase):
                     os.unlink(db_path)
                 # No need to recreate the SQLite DB. SQLite will
                 # create it for us if it's not there...
-            elif conn_string.startswith('mysql'):
+            elif _is_mysql(conn_string) or _is_postgresql(conn_string):
                 # We can execute the MySQL client to destroy and re-create
                 # the MYSQL database, which is easier and less error-prone
                 # than using SQLAlchemy to do this via MetaData...trust me.
@@ -112,11 +126,21 @@ class TestMigrations(unittest.TestCase):
                 if len(auth_pieces) > 1:
                     if auth_pieces[1].strip():
                         password = "-p%s" % auth_pieces[1]
-                sql = ("drop database if exists %(database)s; "
-                       "create database %(database)s;") % locals()
-                cmd = ("mysql -u%(user)s %(password)s -h%(host)s "
-                       "-e\"%(sql)s\"") % locals()
-                exitcode, out, err = execute(cmd)
+                if _is_mysql(conn_string):
+                    sql = ("drop database if exists %(database)s; "
+                           "create database %(database)s;") % locals()
+                    cmd = ("mysql -u%(user)s %(password)s -h%(host)s "
+                           "-e\"%(sql)s\"") % locals()
+                if _is_postgresql(conn_string):
+                    cmd = ("dropdb %(database)s ; "
+                           "createdb %(database)s -O %(user)s ; "
+                           "echo \"select 'drop table if exists ' "
+                           "|| tablename || ' cascade;' "
+                           "from pg_tables where schemaname = 'public';\" | "
+                           "psql -d %(database)s | grep '^\s*drop' | "
+                           "psql -d %(database)s"
+                          ) % locals()
+                exitcode, out, err = utils.execute(cmd)
                 self.assertEqual(0, exitcode)
 
     def test_walk_versions(self):
@@ -125,8 +149,10 @@ class TestMigrations(unittest.TestCase):
         that there are no errors in the version scripts for each engine
         """
         for key, engine in self.engines.items():
-            options = {'sql_connection': TestMigrations.TEST_DATABASES[key]}
-            self._walk_versions(options)
+            conf = utils.TestConfigOpts({
+                    'sql_connection': TestMigrations.TEST_DATABASES[key]})
+            conf.register_opt(cfg.StrOpt('sql_connection'))
+            self._walk_versions(conf)
 
     def test_version_control_existing_db(self):
         """
@@ -135,12 +161,20 @@ class TestMigrations(unittest.TestCase):
         without errors.
         """
         for key, engine in self.engines.items():
+<<<<<<< HEAD
             #conf = utils.TestConfigOpts({
             #        'sql_connection': TestMigrations.TEST_DATABASES[key]})
             #conf.register_opt(cfg.StrOpt('sql_connection'))
             options = {'sql_connection': TestMigrations.TEST_DATABASES[key]}
             self._create_unversioned_001_db(engine)
             self._walk_versions(options, initial_version=1)
+=======
+            conf = utils.TestConfigOpts({
+                    'sql_connection': TestMigrations.TEST_DATABASES[key]})
+            conf.register_opt(cfg.StrOpt('sql_connection'))
+            self._create_unversioned_001_db(engine)
+            self._walk_versions(conf, initial_version=1)
+>>>>>>> upstream/master
 
     def _create_unversioned_001_db(self, engine):
         # Create the initial version of the images table
@@ -160,7 +194,11 @@ class TestMigrations(unittest.TestCase):
             Column('deleted', Boolean(), nullable=False, default=False))
         images_001.create()
 
+<<<<<<< HEAD
     def _walk_versions(self, options, initial_version=0):
+=======
+    def _walk_versions(self, conf, initial_version=0):
+>>>>>>> upstream/master
         # Determine latest version script from the repo, then
         # upgrade from 1 through to the latest, with no data
         # in the databases. This just checks that the schema itself
@@ -169,25 +207,36 @@ class TestMigrations(unittest.TestCase):
         # Assert we are not under version control...
         self.assertRaises(exception.DatabaseMigrationError,
                           migration_api.db_version,
-                          options)
+                          conf)
         # Place the database under version control
+<<<<<<< HEAD
         migration_api.version_control(options, version=initial_version)
 
         cur_version = migration_api.db_version(options)
+=======
+        migration_api.version_control(conf, version=initial_version)
+
+        cur_version = migration_api.db_version(conf)
+>>>>>>> upstream/master
         self.assertEqual(initial_version, cur_version)
 
         for version in xrange(initial_version + 1,
                               TestMigrations.REPOSITORY.latest + 1):
+<<<<<<< HEAD
             migration_api.db_sync(options, version)
             cur_version = migration_api.db_version(options)
+=======
+            migration_api.db_sync(conf, version)
+            cur_version = migration_api.db_version(conf)
+>>>>>>> upstream/master
             self.assertEqual(cur_version, version)
 
         # Now walk it back down to 0 from the latest, testing
         # the downgrade paths.
         for version in reversed(
             xrange(0, TestMigrations.REPOSITORY.latest)):
-            migration_api.downgrade(options, version)
-            cur_version = migration_api.db_version(options)
+            migration_api.downgrade(conf, version)
+            cur_version = migration_api.db_version(conf)
             self.assertEqual(cur_version, version)
 
     def test_no_data_loss_2_to_3_to_2(self):
@@ -199,14 +248,22 @@ class TestMigrations(unittest.TestCase):
         the image_properties table back into the base image table.
         """
         for key, engine in self.engines.items():
-            options = {'sql_connection': TestMigrations.TEST_DATABASES[key]}
-            self._no_data_loss_2_to_3_to_2(engine, options)
+            conf = utils.TestConfigOpts({
+                    'sql_connection': TestMigrations.TEST_DATABASES[key]})
+            conf.register_opt(cfg.StrOpt('sql_connection'))
+            self._no_data_loss_2_to_3_to_2(engine, conf)
 
+<<<<<<< HEAD
     def _no_data_loss_2_to_3_to_2(self, engine, options):
         migration_api.version_control(options, version=0)
         migration_api.upgrade(options, 2)
+=======
+    def _no_data_loss_2_to_3_to_2(self, engine, conf):
+        migration_api.version_control(conf, version=0)
+        migration_api.upgrade(conf, 2)
+>>>>>>> upstream/master
 
-        cur_version = migration_api.db_version(options)
+        cur_version = migration_api.db_version(conf)
         self.assertEquals(2, cur_version)
 
         # We are now on version 2. Check that the images table does
@@ -248,9 +305,9 @@ class TestMigrations(unittest.TestCase):
         # Now let's upgrade to 3. This should move the type column
         # to the image_properties table as type properties.
 
-        migration_api.upgrade(options, 3)
+        migration_api.upgrade(conf, 3)
 
-        cur_version = migration_api.db_version(options)
+        cur_version = migration_api.db_version(conf)
         self.assertEquals(3, cur_version)
 
         images_table = Table('images', MetaData(), autoload=True,
@@ -274,7 +331,7 @@ class TestMigrations(unittest.TestCase):
         # Downgrade to 2 and check that the type properties were moved
         # to the main image table
 
-        migration_api.downgrade(options, 2)
+        migration_api.downgrade(conf, 2)
 
         images_table = Table('images', MetaData(), autoload=True,
                              autoload_with=engine)

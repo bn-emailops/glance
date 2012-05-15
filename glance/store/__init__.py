@@ -16,14 +16,14 @@
 #    under the License.
 
 import logging
-import optparse
 import os
-import urlparse
+import sys
+import time
 
-from glance import registry
-from glance.common import config
 from glance.common import exception
 from glance.common import utils
+from glance.openstack.common import cfg
+from glance import registry
 from glance.store import location
 
 logger = logging.getLogger('glance.store')
@@ -64,6 +64,70 @@ class UnsupportedBackend(BackendException):
     pass
 
 
+class Indexable(object):
+
+    """
+    Wrapper that allows an iterator or filelike be treated as an indexable
+    data structure. This is required in the case where the return value from
+    Store.get() is passed to Store.add() when adding a Copy-From image to a
+    Store where the client library relies on eventlet GreenSockets, in which
+    case the data to be written is indexed over.
+    """
+
+    def __init__(self, wrapped, size):
+        """
+        Initialize the object
+
+        :param wrappped: the wrapped iterator or filelike.
+        :param size: the size of data available
+        """
+        self.wrapped = wrapped
+        self.size = int(size) if size else (wrapped.len
+                                            if hasattr(wrapped, 'len') else 0)
+        self.cursor = 0
+        self.chunk = None
+
+    def __iter__(self):
+        """
+        Delegate iteration to the wrapped instance.
+        """
+        for self.chunk in self.wrapped:
+            yield self.chunk
+
+    def __getitem__(self, i):
+        """
+        Index into the next chunk (or previous chunk in the case where
+        the last data returned was not fully consumed).
+
+        :param i: a slice-to-the-end
+        """
+        start = i.start if isinstance(i, slice) else i
+        if start < self.cursor:
+            return self.chunk[(start - self.cursor):]
+
+        self.chunk = self.another()
+        if self.chunk:
+            self.cursor += len(self.chunk)
+
+        return self.chunk
+
+    def another(self):
+        """Implemented by subclasses to return the next element"""
+        raise NotImplementedError
+
+    def getvalue(self):
+        """
+        Return entire string value... used in testing
+        """
+        return self.wrapped.getvalue()
+
+    def __len__(self):
+        """
+        Length accessor.
+        """
+        return self.size
+
+
 def register_store(store_module, schemes):
     """
     Registers a store module and a set of schemes
@@ -86,7 +150,7 @@ def register_store(store_module, schemes):
     location.register_scheme_map(scheme_map)
 
 
-def create_stores(options):
+def create_stores(conf):
     """
     Construct the store objects with supplied configuration options
     """
@@ -97,7 +161,7 @@ def create_stores(options):
             raise BackendException('Unable to create store. Could not find '
                                    'a class named Store in module %s.'
                                    % store_module)
-        STORES[store_module] = store_class(options)
+        STORES[store_module] = store_class(conf)
 
 
 def get_store_from_scheme(scheme):
@@ -106,7 +170,7 @@ def get_store_from_scheme(scheme):
     for handling that scheme
     """
     if scheme not in location.SCHEME_TO_STORE_MAP:
-        raise exception.UnknownScheme(scheme)
+        raise exception.UnknownScheme(scheme=scheme)
     return STORES[location.SCHEME_TO_STORE_MAP[scheme]]
 
 
@@ -128,6 +192,15 @@ def get_from_backend(uri, **kwargs):
     loc = location.get_location_from_uri(uri)
 
     return store.get(loc)
+
+
+def get_size_from_backend(uri):
+    """Retrieves image size from backend specified by uri"""
+
+    store = get_store_from_uri(uri)
+    loc = location.get_location_from_uri(uri)
+
+    return store.get_size(loc)
 
 
 def delete_from_backend(uri, **kwargs):
@@ -153,20 +226,61 @@ def get_store_from_location(uri):
     return loc.store_name
 
 
-def schedule_delete_from_backend(uri, options, context, image_id, **kwargs):
+scrubber_datadir_opt = cfg.StrOpt('scrubber_datadir',
+                                  default='/var/lib/glance/scrubber')
+
+
+def get_scrubber_datadir(conf):
+    conf.register_opt(scrubber_datadir_opt)
+    return conf.scrubber_datadir
+
+
+delete_opts = [
+    cfg.BoolOpt('delayed_delete', default=False),
+    cfg.IntOpt('scrub_time', default=0)
+    ]
+
+
+def schedule_delete_from_backend(uri, conf, context, image_id, **kwargs):
     """
     Given a uri and a time, schedule the deletion of an image.
     """
-    use_delay = config.get_option(options, 'delayed_delete', type='bool',
-                                  default=False)
-    if not use_delay:
-        registry.update_image_metadata(options, context, image_id,
+    conf.register_opts(delete_opts)
+    if not conf.delayed_delete:
+        registry.update_image_metadata(context, image_id,
                                        {'status': 'deleted'})
         try:
             return delete_from_backend(uri, **kwargs)
-        except (UnsupportedBackend, exception.NotFound):
-            msg = _("Failed to delete image from store (%(uri)s).") % locals()
+        except (UnsupportedBackend,
+                exception.StoreDeleteNotSupported,
+                exception.NotFound):
+            exc_type = sys.exc_info()[0].__name__
+            msg = _("Failed to delete image at %s from store (%s)") % \
+                  (uri, exc_type)
             logger.error(msg)
+        finally:
+            # avoid falling through to the delayed deletion logic
+            return
 
-    registry.update_image_metadata(options, context, image_id,
+    datadir = get_scrubber_datadir(conf)
+    delete_time = time.time() + conf.scrub_time
+    file_path = os.path.join(datadir, str(image_id))
+    utils.safe_mkdirs(datadir)
+
+    if os.path.exists(file_path):
+        msg = _("Image id %(image_id)s already queued for delete") % {
+                'image_id': image_id}
+        raise exception.Duplicate(msg)
+
+    with open(file_path, 'w') as f:
+        f.write('\n'.join([uri, str(int(delete_time))]))
+    os.chmod(file_path, 0600)
+    os.utime(file_path, (delete_time, delete_time))
+
+    registry.update_image_metadata(context, image_id,
                                    {'status': 'pending_delete'})
+
+
+def add_to_backend(scheme, image_id, data, size):
+    store = get_store_from_scheme(scheme)
+    return store.add(image_id, data, size)

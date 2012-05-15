@@ -20,10 +20,9 @@
 SQLAlchemy models for glance data
 """
 
-import sys
 import datetime
 
-from sqlalchemy.orm import relationship, backref, exc, object_mapper, validates
+from sqlalchemy.orm import relationship, backref, object_mapper
 from sqlalchemy import Column, Integer, String, BigInteger
 from sqlalchemy import ForeignKey, DateTime, Boolean, Text
 from sqlalchemy import UniqueConstraint
@@ -31,7 +30,7 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.ext.declarative import declarative_base
 
 import glance.registry.db.api
-from glance.common import exception
+from glance.common import utils
 
 BASE = declarative_base()
 
@@ -50,7 +49,8 @@ class ModelBase(object):
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow,
                         nullable=False)
-    updated_at = Column(DateTime, onupdate=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow,
+                        nullable=False, onupdate=datetime.datetime.utcnow)
     deleted_at = Column(DateTime)
     deleted = Column(Boolean, nullable=False, default=False)
 
@@ -102,7 +102,7 @@ class Image(BASE, ModelBase):
     """Represents an image in the datastore"""
     __tablename__ = 'images'
 
-    id = Column(Integer, primary_key=True)
+    id = Column(String(36), primary_key=True, default=utils.generate_uuid)
     name = Column(String(255))
     disk_format = Column(String(20))
     container_format = Column(String(20))
@@ -111,9 +111,15 @@ class Image(BASE, ModelBase):
     is_public = Column(Boolean, nullable=False, default=False)
     location = Column(Text)
     checksum = Column(String(32))
+<<<<<<< HEAD
     min_disk = Column(Integer(), default=0)
     min_ram = Column(Integer(), default=0)
+=======
+    min_disk = Column(Integer(), nullable=False, default=0)
+    min_ram = Column(Integer(), nullable=False, default=0)
+>>>>>>> upstream/master
     owner = Column(String(255))
+    protected = Column(Boolean, nullable=False, default=False)
 
 
 class ImageProperty(BASE, ModelBase):
@@ -122,11 +128,21 @@ class ImageProperty(BASE, ModelBase):
     __table_args__ = (UniqueConstraint('image_id', 'name'), {})
 
     id = Column(Integer, primary_key=True)
-    image_id = Column(Integer, ForeignKey('images.id'), nullable=False)
+    image_id = Column(String(36), ForeignKey('images.id'),
+                      nullable=False)
     image = relationship(Image, backref=backref('properties'))
 
     name = Column(String(255), index=True, nullable=False)
     value = Column(Text)
+
+
+class ImageTag(BASE, ModelBase):
+    """Represents an image tag in the datastore"""
+    __tablename__ = 'image_tags'
+
+    id = Column(Integer, primary_key=True, nullable=False)
+    image_id = Column(String(36), ForeignKey('images.id'), nullable=False)
+    value = Column(String(255), nullable=False)
 
 
 class ImageMember(BASE, ModelBase):
@@ -135,7 +151,8 @@ class ImageMember(BASE, ModelBase):
     __table_args__ = (UniqueConstraint('image_id', 'member'), {})
 
     id = Column(Integer, primary_key=True)
-    image_id = Column(Integer, ForeignKey('images.id'), nullable=False)
+    image_id = Column(String(36), ForeignKey('images.id'),
+                      nullable=False)
     image = relationship(Image, backref=backref('members'))
 
     member = Column(String(255), nullable=False)

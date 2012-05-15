@@ -1,6 +1,12 @@
 # Packages needed for dev testing
 distribute>=0.6.24
 
+<<<<<<< HEAD
+=======
+# For translations processing
+Babel
+
+>>>>>>> upstream/master
 # Needed for testing
 mox
 nose
@@ -9,3 +15,7 @@ nosexcover
 openstack.nose_plugin
 pep8==0.6.1
 sphinx>=1.1.2
+<<<<<<< HEAD
+=======
+requests
+>>>>>>> upstream/master

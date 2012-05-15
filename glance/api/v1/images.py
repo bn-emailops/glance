@@ -19,49 +19,62 @@
 /images endpoint for Glance v1 API
 """
 
-import httplib
-import json
+import errno
 import logging
 import sys
 import traceback
 
-import webob
-from webob.exc import (HTTPNotFound,
+from webob.exc import (HTTPError,
+                       HTTPNotFound,
                        HTTPConflict,
                        HTTPBadRequest,
                        HTTPForbidden,
-                       HTTPNoContent,
-                       HTTPUnauthorized)
+                       HTTPRequestEntityTooLarge,
+                       HTTPServiceUnavailable,
+                      )
 
-from glance import api
-from glance import image_cache
+from glance.api import policy
+import glance.api.v1
+from glance.api.v1 import controller
+from glance.api.v1 import filters
 from glance.common import exception
-from glance.common import notifier
 from glance.common import wsgi
+from glance.common import utils
+from glance.openstack.common import cfg
 import glance.store
 import glance.store.filesystem
 import glance.store.http
+import glance.store.rbd
 import glance.store.s3
 import glance.store.swift
 from glance.store import (get_from_backend,
+                          get_size_from_backend,
                           schedule_delete_from_backend,
                           get_store_from_location,
-                          get_store_from_scheme,
-                          UnsupportedBackend)
+                          get_store_from_scheme)
 from glance import registry
-from glance import utils
+from glance import notifier
 
 
-logger = logging.getLogger('glance.api.v1.images')
+logger = logging.getLogger(__name__)
+SUPPORTED_PARAMS = glance.api.v1.SUPPORTED_PARAMS
+SUPPORTED_FILTERS = glance.api.v1.SUPPORTED_FILTERS
 
+<<<<<<< HEAD
 SUPPORTED_FILTERS = ['name', 'status', 'container_format', 'disk_format',
                      'min_ram', 'min_disk', 'size_min', 'size_max',
                      'is_public']
+=======
+>>>>>>> upstream/master
 
-SUPPORTED_PARAMS = ('limit', 'marker', 'sort_key', 'sort_dir')
+# 1 PiB, which is a *huge* image by anyone's measure.  This is just to protect
+# against client programming errors (or DoS attacks) in the image metadata.
+# We have a known limit of 1 << 63 in the database -- images.size is declared
+# as a BigInteger.
+IMAGE_SIZE_CAP = 1 << 50
 
 
-class Controller(api.BaseController):
+class Controller(controller.BaseController):
     """
     WSGI controller for images resource in Glance v1 API
 
@@ -80,10 +93,23 @@ class Controller(api.BaseController):
         DELETE /images/<ID> -- Delete the image with id <ID>
     """
 
-    def __init__(self, options):
-        self.options = options
-        glance.store.create_stores(options)
-        self.notifier = notifier.Notifier(options)
+    default_store_opt = cfg.StrOpt('default_store', default='file')
+
+    def __init__(self, conf):
+        self.conf = conf
+        self.conf.register_opt(self.default_store_opt)
+        glance.store.create_stores(conf)
+        self.verify_store_or_exit(self.conf.default_store)
+        self.notifier = notifier.Notifier(conf)
+        registry.configure_registry_client(conf)
+        self.policy = policy.Enforcer(conf)
+
+    def _enforce(self, req, action):
+        """Authorize an action against our policies"""
+        try:
+            self.policy.enforce(req.context, action, {})
+        except exception.Forbidden:
+            raise HTTPForbidden()
 
     def index(self, req):
         """
@@ -108,10 +134,10 @@ class Controller(api.BaseController):
                  'size': <SIZE>}, ...
             ]}
         """
+        self._enforce(req, 'get_images')
         params = self._get_query_params(req)
         try:
-            images = registry.get_images_list(self.options, req.context,
-                                              **params)
+            images = registry.get_images_list(req.context, **params)
         except exception.Invalid, e:
             raise HTTPBadRequest(explanation="%s" % e)
 
@@ -141,10 +167,15 @@ class Controller(api.BaseController):
                  'properties': {'distro': 'Ubuntu 10.04 LTS', ...}}, ...
             ]}
         """
+        self._enforce(req, 'get_images')
         params = self._get_query_params(req)
         try:
+<<<<<<< HEAD
             images = registry.get_images_detail(self.options, req.context,
                                                 **params)
+=======
+            images = registry.get_images_detail(req.context, **params)
+>>>>>>> upstream/master
             # Strip out the Location attribute. Temporary fix for
             # LP Bug #755916. This information is still coming back
             # from the registry, since the API server still needs access
@@ -164,9 +195,10 @@ class Controller(api.BaseController):
         :retval dict of parameters that can be used by registry client
         """
         params = {'filters': self._get_filters(req)}
+
         for PARAM in SUPPORTED_PARAMS:
-            if PARAM in req.str_params:
-                params[PARAM] = req.str_params.get(PARAM)
+            if PARAM in req.params:
+                params[PARAM] = req.params.get(PARAM)
         return params
 
     def _get_filters(self, req):
@@ -176,12 +208,15 @@ class Controller(api.BaseController):
         :param req: the Request object coming from the wsgi layer
         :retval a dict of key/value filters
         """
-        filters = {}
-        for param in req.str_params:
+        query_filters = {}
+        for param in req.params:
             if param in SUPPORTED_FILTERS or param.startswith('property-'):
-                filters[param] = req.str_params.get(param)
-
-        return filters
+                query_filters[param] = req.params.get(param)
+                if not filters.validate(param, query_filters[param]):
+                    raise HTTPBadRequest('Bad value passed to filter %s '
+                                         'got %s' % (param,
+                                                     query_filters[param]))
+        return query_filters
 
     def meta(self, req, id):
         """
@@ -194,11 +229,49 @@ class Controller(api.BaseController):
 
         :raises HTTPNotFound if image metadata is not available to user
         """
+<<<<<<< HEAD
+=======
+        self._enforce(req, 'get_image')
+>>>>>>> upstream/master
         image_meta = self.get_image_meta_or_404(req, id)
         del image_meta['location']
         return {
             'image_meta': image_meta
         }
+
+    @staticmethod
+    def _validate_source(source, req):
+        """
+        External sources (as specified via the location or copy-from headers)
+        are supported only over non-local store types, i.e. S3, Swift, HTTP.
+        Note the absence of file:// for security reasons, see LP bug #942118.
+        If the above constraint is violated, we reject with 400 "Bad Request".
+        """
+        if source:
+            for scheme in ['s3', 'swift', 'http']:
+                if source.lower().startswith(scheme):
+                    return source
+            msg = _("External sourcing not supported for store %s") % source
+            logger.error(msg)
+            raise HTTPBadRequest(msg, request=req, content_type="text/plain")
+
+    @staticmethod
+    def _copy_from(req):
+        return req.headers.get('x-glance-api-copy-from')
+
+    @staticmethod
+    def _external_source(image_meta, req):
+        source = image_meta.get('location', Controller._copy_from(req))
+        return Controller._validate_source(source, req)
+
+    @staticmethod
+    def _get_from_store(where):
+        try:
+            image_data, image_size = get_from_backend(where)
+        except exception.NotFound, e:
+            raise HTTPNotFound(explanation="%s" % e)
+        image_size = int(image_size) if image_size else None
+        return image_data, image_size
 
     def show(self, req, id):
         """
@@ -210,8 +283,10 @@ class Controller(api.BaseController):
 
         :raises HTTPNotFound if image is not available to user
         """
-        image = self.get_active_image_meta_or_404(req, id)
+        self._enforce(req, 'get_image')
+        image_meta = self.get_active_image_meta_or_404(req, id)
 
+<<<<<<< HEAD
         def get_from_store(image_meta):
             """Called if caching disabled"""
             try:
@@ -274,9 +349,15 @@ class Controller(api.BaseController):
             image_iterator = get_from_store(image)
 
         del image['location']
+=======
+        image_iterator, size = self._get_from_store(image_meta['location'])
+        image_meta['size'] = size or image_meta['size']
+
+        del image_meta['location']
+>>>>>>> upstream/master
         return {
             'image_iterator': image_iterator,
-            'image_meta': image,
+            'image_meta': image_meta,
         }
 
     def _reserve(self, req, image_meta):
@@ -287,28 +368,30 @@ class Controller(api.BaseController):
 
         :param req: The WSGI/Webob Request object
         :param id: The opaque image identifier
+        :param image_meta: The image metadata
 
         :raises HTTPConflict if image already exists
         :raises HTTPBadRequest if image metadata is not valid
         """
-        location = image_meta.get('location')
+        location = self._external_source(image_meta, req)
         if location:
             store = get_store_from_location(location)
             # check the store exists before we hit the registry, but we
             # don't actually care what it is at this point
             self.get_store_or_400(req, store)
 
+            # retrieve the image size from remote store (if not provided)
+            image_meta['size'] = self._get_size(image_meta, location)
+        else:
+            # Ensure that the size attribute is set to zero for directly
+            # uploadable images (if not provided). The size will be set
+            # to a non-zero value during upload
+            image_meta['size'] = image_meta.get('size', 0)
+
         image_meta['status'] = 'queued'
 
-        # Ensure that the size attribute is set to zero for all
-        # queued instances. The size will be set to a non-zero
-        # value during upload
-        image_meta['size'] = image_meta.get('size', 0)
-
         try:
-            image_meta = registry.add_image_metadata(self.options,
-                                                     req.context,
-                                                     image_meta)
+            image_meta = registry.add_image_metadata(req.context, image_meta)
             return image_meta
         except exception.Duplicate:
             msg = (_("An image with identifier %s already exists")
@@ -320,11 +403,10 @@ class Controller(api.BaseController):
             for line in msg.split('\n'):
                 logger.error(line)
             raise HTTPBadRequest(msg, request=req, content_type="text/plain")
-        except exception.NotAuthorized:
-            msg = _("Not authorized to reserve image.")
+        except exception.Forbidden:
+            msg = _("Forbidden to reserve image.")
             logger.error(msg)
-            raise HTTPForbidden(msg, request=req,
-                                content_type="text/plain")
+            raise HTTPForbidden(msg, request=req, content_type="text/plain")
 
     def _upload(self, req, image_meta):
         """
@@ -339,26 +421,22 @@ class Controller(api.BaseController):
         :raises HTTPConflict if image already exists
         :retval The location where the image was stored
         """
-        try:
-            req.get_content_type('application/octet-stream')
-        except exception.InvalidContentType:
-            self._safe_kill(req, image_meta['id'])
-            msg = _("Content-Type must be application/octet-stream")
-            logger.error(msg)
-            raise HTTPBadRequest(explanation=msg)
 
-        store_name = req.headers.get('x-image-meta-store',
-                                     self.options['default_store'])
+        copy_from = self._copy_from(req)
+        if copy_from:
+            image_data, image_size = self._get_from_store(copy_from)
+            image_meta['size'] = image_size or image_meta['size']
+        else:
+            try:
+                req.get_content_type('application/octet-stream')
+            except exception.InvalidContentType:
+                self._safe_kill(req, image_meta['id'])
+                msg = _("Content-Type must be application/octet-stream")
+                logger.error(msg)
+                raise HTTPBadRequest(explanation=msg)
 
-        store = self.get_store_or_400(req, store_name)
+            image_data = req.body_file
 
-        image_id = image_meta['id']
-        logger.debug(_("Setting image %s to status 'saving'"), image_id)
-        registry.update_image_metadata(self.options, req.context, image_id,
-                                       {'status': 'saving'})
-        try:
-            logger.debug(_("Uploading image data for image %(image_id)s "
-                         "to %(store_name)s store"), locals())
             if req.content_length:
                 image_size = int(req.content_length)
             elif 'x-image-meta-size' in req.headers:
@@ -367,8 +445,30 @@ class Controller(api.BaseController):
                 logger.debug(_("Got request with no content-length and no "
                                "x-image-meta-size header"))
                 image_size = 0
+
+        store_name = req.headers.get('x-image-meta-store',
+                                     self.conf.default_store)
+
+        store = self.get_store_or_400(req, store_name)
+
+        image_id = image_meta['id']
+        logger.debug(_("Setting image %s to status 'saving'"), image_id)
+        registry.update_image_metadata(req.context, image_id,
+                                       {'status': 'saving'})
+        try:
+            logger.debug(_("Uploading image data for image %(image_id)s "
+                         "to %(store_name)s store"), locals())
+
+            if image_size > IMAGE_SIZE_CAP:
+                max_image_size = IMAGE_SIZE_CAP
+                msg = _("Denying attempt to upload image larger than "
+                        "%(max_image_size)d. Supplied image size was "
+                        "%(image_size)d") % locals()
+                logger.warn(msg)
+                raise HTTPBadRequest(msg, request=req)
+
             location, size, checksum = store.add(image_meta['id'],
-                                                 req.body_file,
+                                                 image_data,
                                                  image_size)
 
             # Verify any supplied checksum value matches checksum
@@ -389,8 +489,7 @@ class Controller(api.BaseController):
             logger.debug(_("Updating image %(image_id)s data. "
                          "Checksum set to %(checksum)s, size set "
                          "to %(size)d"), locals())
-            registry.update_image_metadata(self.options, req.context,
-                                           image_id,
+            registry.update_image_metadata(req.context, image_id,
                                            {'checksum': checksum,
                                             'size': size})
             self.notifier.info('image.upload', image_meta)
@@ -404,13 +503,33 @@ class Controller(api.BaseController):
             self.notifier.error('image.upload', msg)
             raise HTTPConflict(msg, request=req)
 
-        except exception.NotAuthorized, e:
-            msg = _("Unauthorized upload attempt: %s") % e
+        except exception.Forbidden, e:
+            msg = _("Forbidden upload attempt: %s") % e
             logger.error(msg)
             self._safe_kill(req, image_id)
             self.notifier.error('image.upload', msg)
-            raise HTTPForbidden(msg, request=req,
-                                content_type='text/plain')
+            raise HTTPForbidden(msg, request=req, content_type="text/plain")
+
+        except exception.StorageFull, e:
+            msg = _("Image storage media is full: %s") % e
+            logger.error(msg)
+            self._safe_kill(req, image_id)
+            self.notifier.error('image.upload', msg)
+            raise HTTPRequestEntityTooLarge(msg, request=req,
+                                            content_type='text/plain')
+
+        except exception.StorageWriteDenied, e:
+            msg = _("Insufficient permissions on image storage media: %s") % e
+            logger.error(msg)
+            self._safe_kill(req, image_id)
+            self.notifier.error('image.upload', msg)
+            raise HTTPServiceUnavailable(msg, request=req,
+                                         content_type='text/plain')
+
+        except HTTPError, e:
+            self._safe_kill(req, image_id)
+            self.notifier.error('image.upload', e.explanation)
+            raise
 
         except Exception, e:
             tb_info = traceback.format_exc()
@@ -437,10 +556,18 @@ class Controller(api.BaseController):
         image_meta = {}
         image_meta['location'] = location
         image_meta['status'] = 'active'
-        return registry.update_image_metadata(self.options,
-                                       req.context,
-                                       image_id,
-                                       image_meta)
+
+        try:
+            return registry.update_image_metadata(req.context,
+                                                  image_id,
+                                                  image_meta)
+        except exception.Invalid, e:
+            msg = (_("Failed to activate image. Got error: %(e)s")
+                   % locals())
+            for line in msg.split('\n'):
+                logger.error(line)
+            self.notifier.error('image.update', msg)
+            raise HTTPBadRequest(msg, request=req, content_type="text/plain")
 
     def _kill(self, req, image_id):
         """
@@ -449,9 +576,7 @@ class Controller(api.BaseController):
         :param req: The WSGI/Webob Request object
         :param image_id: Opaque image identifier
         """
-        registry.update_image_metadata(self.options,
-                                       req.context,
-                                       image_id,
+        registry.update_image_metadata(req.context, image_id,
                                        {'status': 'killed'})
 
     def _safe_kill(self, req, image_id):
@@ -490,21 +615,42 @@ class Controller(api.BaseController):
         location = self._upload(req, image_meta)
         return self._activate(req, image_id, location)
 
+    def _get_size(self, image_meta, location):
+        # retrieve the image size from remote store (if not provided)
+        return image_meta.get('size', 0) or get_size_from_backend(location)
+
+    def _handle_source(self, req, image_id, image_meta, image_data):
+        if image_data or self._copy_from(req):
+            image_meta = self._upload_and_activate(req, image_meta)
+        else:
+            location = image_meta.get('location')
+            if location:
+                image_meta = self._activate(req, image_id, location)
+        return image_meta
+
     def create(self, req, image_meta, image_data):
         """
-        Adds a new image to Glance. Three scenarios exist when creating an
+        Adds a new image to Glance. Four scenarios exist when creating an
         image:
 
-        1. If the image data is available for upload, create can be passed the
-           image data as the request body and the metadata as the request
-           headers. The image will initially be 'queued', during upload it
-           will be in the 'saving' status, and then 'killed' or 'active'
-           depending on whether the upload completed successfully.
+        1. If the image data is available directly for upload, create can be
+           passed the image data as the request body and the metadata as the
+           request headers. The image will initially be 'queued', during
+           upload it will be in the 'saving' status, and then 'killed' or
+           'active' depending on whether the upload completed successfully.
 
-        2. If the image data exists somewhere else, you can pass in the source
-           using the x-image-meta-location header
+        2. If the image data exists somewhere else, you can upload indirectly
+           from the external source using the x-glance-api-copy-from header.
+           Once the image is uploaded, the external store is not subsequently
+           consulted, i.e. the image content is served out from the configured
+           glance image store.  State transitions are as for option #1.
 
-        3. If the image data is not available yet, but you'd like reserve a
+        3. If the image data exists somewhere else, you can reference the
+           source using the x-image-meta-location header. The image content
+           will be served out from the external store, i.e. is never uploaded
+           to the configured glance image store.
+
+        4. If the image data is not available yet, but you'd like reserve a
            spot for it, you can omit the data and a record will be created in
            the 'queued' state. This exists primarily to maintain backwards
            compatibility with OpenStack/Rackspace API semantics.
@@ -524,6 +670,9 @@ class Controller(api.BaseController):
                 and the request body is not application/octet-stream
                 image data.
         """
+        self._enforce(req, 'add_image')
+        if image_meta.get('is_public'):
+            self._enforce(req, 'publicize_image')
         if req.context.read_only:
             msg = _("Read-only access")
             logger.debug(msg)
@@ -531,14 +680,13 @@ class Controller(api.BaseController):
                                 content_type="text/plain")
 
         image_meta = self._reserve(req, image_meta)
-        image_id = image_meta['id']
+        id = image_meta['id']
 
-        if image_data is not None:
-            image_meta = self._upload_and_activate(req, image_meta)
-        else:
-            location = image_meta.get('location')
-            if location:
-                image_meta = self._activate(req, image_id, location)
+        image_meta = self._handle_source(req, id, image_meta, image_data)
+
+        # Prevent client from learning the location, as it
+        # could contain security credentials
+        image_meta.pop('location', None)
 
         # Prevent client from learning the location, as it
         # could contain security credentials
@@ -555,6 +703,9 @@ class Controller(api.BaseController):
 
         :retval Returns the updated image information as a mapping
         """
+        self._enforce(req, 'modify_image')
+        if image_meta.get('is_public'):
+            self._enforce(req, 'publicize_image')
         if req.context.read_only:
             msg = _("Read-only access")
             logger.debug(msg)
@@ -564,15 +715,46 @@ class Controller(api.BaseController):
         orig_image_meta = self.get_image_meta_or_404(req, id)
         orig_status = orig_image_meta['status']
 
+        # The default behaviour for a PUT /images/<IMAGE_ID> is to
+        # override any properties that were previously set. This, however,
+        # leads to a number of issues for the common use case where a caller
+        # registers an image with some properties and then almost immediately
+        # uploads an image file along with some more properties. Here, we
+        # check for a special header value to be false in order to force
+        # properties NOT to be purged. However we also disable purging of
+        # properties if an image file is being uploaded...
+        purge_props = req.headers.get('x-glance-registry-purge-props', True)
+        purge_props = (utils.bool_from_string(purge_props) and
+                       image_data is None)
+
         if image_data is not None and orig_status != 'queued':
             raise HTTPConflict(_("Cannot upload to an unqueued image"))
 
+        # Only allow the Location|Copy-From fields to be modified if the
+        # image is in queued status, which indicates that the user called
+        # POST /images but originally supply neither a Location|Copy-From
+        # field NOR image data
+        location = self._external_source(image_meta, req)
+        reactivating = orig_status != 'queued' and location
+        activating = orig_status == 'queued' and (location or image_data)
+
+        if reactivating:
+            msg = _("Attempted to update Location field for an image "
+                    "not in queued status.")
+            raise HTTPBadRequest(msg, request=req, content_type="text/plain")
+
         try:
-            image_meta = registry.update_image_metadata(self.options,
-                                                        req.context, id,
-                                                        image_meta, True)
-            if image_data is not None:
-                image_meta = self._upload_and_activate(req, image_meta)
+            if location:
+                image_meta['size'] = self._get_size(image_meta, location)
+
+            image_meta = registry.update_image_metadata(req.context,
+                                                        id,
+                                                        image_meta,
+                                                        purge_props)
+
+            if activating:
+                image_meta = self._handle_source(req, id, image_meta,
+                                                 image_data)
         except exception.Invalid, e:
             msg = (_("Failed to update image metadata. Got error: %(e)s")
                    % locals())
@@ -586,6 +768,12 @@ class Controller(api.BaseController):
                 logger.info(line)
             self.notifier.info('image.update', msg)
             raise HTTPNotFound(msg, request=req, content_type="text/plain")
+        except exception.Forbidden, e:
+            msg = ("Forbidden to update image: %(e)s" % locals())
+            for line in msg.split('\n'):
+                logger.info(line)
+            self.notifier.info('image.update', msg)
+            raise HTTPForbidden(msg, request=req, content_type="text/plain")
         else:
             self.notifier.info('image.update', image_meta)
 
@@ -604,9 +792,10 @@ class Controller(api.BaseController):
 
         :raises HttpBadRequest if image registry is invalid
         :raises HttpNotFound if image or any chunk is not available
-        :raises HttpNotAuthorized if image or any chunk is not
+        :raises HttpUnauthorized if image or any chunk is not
                 deleteable by the requesting user
         """
+        self._enforce(req, 'delete_image')
         if req.context.read_only:
             msg = _("Read-only access")
             logger.debug(msg)
@@ -614,6 +803,11 @@ class Controller(api.BaseController):
                                 content_type="text/plain")
 
         image = self.get_image_meta_or_404(req, id)
+        if image['protected']:
+            msg = _("Image is protected")
+            logger.debug(msg)
+            raise HTTPForbidden(msg, request=req,
+                                content_type="text/plain")
 
         # The image's location field may be None in the case
         # of a saving or queued image, therefore don't ask a backend
@@ -621,70 +815,23 @@ class Controller(api.BaseController):
         # See https://bugs.launchpad.net/glance/+bug/747799
         try:
             if image['location']:
-                schedule_delete_from_backend(image['location'], self.options,
+                schedule_delete_from_backend(image['location'], self.conf,
                                              req.context, id)
-            registry.delete_image_metadata(self.options, req.context, id)
+            registry.delete_image_metadata(req.context, id)
         except exception.NotFound, e:
             msg = ("Failed to find image to delete: %(e)s" % locals())
             for line in msg.split('\n'):
                 logger.info(line)
             self.notifier.info('image.delete', msg)
             raise HTTPNotFound(msg, request=req, content_type="text/plain")
+        except exception.Forbidden, e:
+            msg = ("Forbidden to delete image: %(e)s" % locals())
+            for line in msg.split('\n'):
+                logger.info(line)
+            self.notifier.info('image.delete', msg)
+            raise HTTPForbidden(msg, request=req, content_type="text/plain")
         else:
             self.notifier.info('image.delete', id)
-
-    def members(self, req, image_id):
-        """
-        Return a list of dictionaries indicating the members of the
-        image, i.e., those tenants the image is shared with.
-
-        :param req: the Request object coming from the wsgi layer
-        :param image_id: The opaque image identifier
-        :retval The response body is a mapping of the following form::
-
-            {'members': [
-                {'member_id': <MEMBER>,
-                 'can_share': <SHARE_PERMISSION>, ...}, ...
-            ]}
-        """
-        try:
-            members = registry.get_image_members(self.options, req.context,
-                                                 image_id)
-        except exception.NotFound:
-            msg = _("Image with identifier %s not found") % image_id
-            logger.debug(msg)
-            raise HTTPNotFound(msg, request=req, content_type='text/plain')
-        except exception.NotAuthorized:
-            msg = _("Unauthorized image access")
-            logger.debug(msg)
-            raise HTTPForbidden(msg, request=req, content_type='text/plain')
-        return dict(members=members)
-
-    def shared_images(self, req, member):
-        """
-        Retrieves list of image memberships for the given member.
-
-        :param req: the Request object coming from the wsgi layer
-        :param member: the opaque member identifier
-        :retval The response body is a mapping of the following form::
-
-            {'shared_images': [
-                {'image_id': <IMAGE>,
-                 'can_share': <SHARE_PERMISSION>, ...}, ...
-            ]}
-        """
-        try:
-            members = registry.get_member_images(self.options, req.context,
-                                                 member)
-        except exception.NotFound, e:
-            msg = "%s" % e
-            logger.debug(msg)
-            raise HTTPNotFound(msg, request=req, content_type='text/plain')
-        except exception.NotAuthorized, e:
-            msg = "%s" % e
-            logger.debug(msg)
-            raise HTTPForbidden(msg, request=req, content_type='text/plain')
-        return dict(shared_images=members)
 
     def get_store_or_400(self, request, store_name):
         """
@@ -692,9 +839,9 @@ class Controller(api.BaseController):
         or raises an HTTPBadRequest (400) response
 
         :param request: The WSGI/Webob Request object
-        :param id: The opaque image identifier
+        :param store_name: The backend store name
 
-        :raises HTTPNotFound if image does not exist
+        :raises HTTPNotFound if store does not exist
         """
         try:
             return get_store_from_scheme(store_name)
@@ -705,93 +852,23 @@ class Controller(api.BaseController):
             raise HTTPBadRequest(msg, request=request,
                                  content_type='text/plain')
 
-    def replace_members(self, req, image_id, body):
+    def verify_store_or_exit(self, store_name):
         """
-        Replaces the members of the image with those specified in the
-        body.  The body is a dict with the following format::
+        Verifies availability of the storage backend for the
+        given store name or exits
 
-            {"memberships": [
-                {"member_id": <MEMBER_ID>,
-                 ["can_share": [True|False]]}, ...
-            ]}
+        :param store_name: The backend store name
         """
-        if req.context.read_only:
-            raise HTTPForbidden()
-        elif req.context.owner is None:
-            raise HTTPUnauthorized(_("No authenticated user"))
-
         try:
-            registry.replace_members(self.options, req.context,
-                                     image_id, body)
-        except exception.NotFound, e:
-            msg = "%s" % e
-            logger.debug(msg)
-            raise HTTPNotFound(msg, request=req, content_type='text/plain')
-        except exception.NotAuthorized, e:
-            msg = "%s" % e
-            logger.debug(msg)
-            raise HTTPNotFound(msg, request=req, content_type='text/plain')
-
-        return HTTPNoContent()
-
-    def add_member(self, req, image_id, member, body=None):
-        """
-        Adds a membership to the image, or updates an existing one.
-        If a body is present, it is a dict with the following format::
-
-            {"member": {
-                "can_share": [True|False]
-            }}
-
-        If "can_share" is provided, the member's ability to share is
-        set accordingly.  If it is not provided, existing memberships
-        remain unchanged and new memberships default to False.
-        """
-        if req.context.read_only:
-            raise HTTPForbidden()
-        elif req.context.owner is None:
-            raise HTTPUnauthorized(_("No authenticated user"))
-
-        # Figure out can_share
-        can_share = None
-        if body and 'member' in body and 'can_share' in body['member']:
-            can_share = bool(body['member']['can_share'])
-        try:
-            registry.add_member(self.options, req.context, image_id, member,
-                                can_share)
-        except exception.NotFound, e:
-            msg = "%s" % e
-            logger.debug(msg)
-            raise HTTPNotFound(msg, request=req, content_type='text/plain')
-        except exception.NotAuthorized, e:
-            msg = "%s" % e
-            logger.debug(msg)
-            raise HTTPNotFound(msg, request=req, content_type='text/plain')
-
-        return HTTPNoContent()
-
-    def delete_member(self, req, image_id, member):
-        """
-        Removes a membership from the image.
-        """
-        if req.context.read_only:
-            raise HTTPForbidden()
-        elif req.context.owner is None:
-            raise HTTPUnauthorized(_("No authenticated user"))
-
-        try:
-            registry.delete_member(self.options, req.context,
-                                   image_id, member)
-        except exception.NotFound, e:
-            msg = "%s" % e
-            logger.debug(msg)
-            raise HTTPNotFound(msg, request=req, content_type='text/plain')
-        except exception.NotAuthorized, e:
-            msg = "%s" % e
-            logger.debug(msg)
-            raise HTTPNotFound(msg, request=req, content_type='text/plain')
-
-        return HTTPNoContent()
+            get_store_from_scheme(store_name)
+        except exception.UnknownScheme:
+            msg = (_("Default store %s not available on this Glance server\n")
+                   % store_name)
+            logger.error(msg)
+            # message on stderr will only be visible if started directly via
+            # bin/glance-api, as opposed to being daemonized by glance-control
+            sys.stderr.write(msg)
+            sys.exit(255)
 
 
 class ImageDeserializer(wsgi.JSONRequestDeserializer):
@@ -799,7 +876,25 @@ class ImageDeserializer(wsgi.JSONRequestDeserializer):
 
     def _deserialize(self, request):
         result = {}
-        result['image_meta'] = utils.get_image_meta_from_headers(request)
+        try:
+            result['image_meta'] = utils.get_image_meta_from_headers(request)
+        except exception.Invalid:
+            image_size_str = request.headers['x-image-meta-size']
+            msg = _("Incoming image size of %s was not convertible to "
+                    "an integer.") % image_size_str
+            raise HTTPBadRequest(msg, request=request)
+
+        image_meta = result['image_meta']
+        if 'size' in image_meta:
+            incoming_image_size = image_meta['size']
+            if incoming_image_size > IMAGE_SIZE_CAP:
+                max_image_size = IMAGE_SIZE_CAP
+                msg = _("Denying attempt to upload image larger than "
+                        "%(max_image_size)d. Supplied image size was "
+                        "%(incoming_image_size)d") % locals()
+                logger.warn(msg)
+                raise HTTPBadRequest(msg, request=request)
+
         data = request.body_file if self.has_body(request) else None
         result['image_data'] = data
         return result
@@ -813,6 +908,10 @@ class ImageDeserializer(wsgi.JSONRequestDeserializer):
 
 class ImageSerializer(wsgi.JSONResponseSerializer):
     """Handles serialization of specific controller method responses."""
+
+    def __init__(self, conf):
+        self.conf = conf
+        self.notifier = notifier.Notifier(conf)
 
     def _inject_location_header(self, response, image_meta):
         location = self._get_image_location(image_meta)
@@ -849,10 +948,72 @@ class ImageSerializer(wsgi.JSONResponseSerializer):
         self._inject_checksum_header(response, image_meta)
         return response
 
+    def image_send_notification(self, bytes_written, expected_size,
+                                image_meta, request):
+        """Send an image.send message to the notifier."""
+        try:
+            context = request.context
+            payload = {
+                'bytes_sent': bytes_written,
+                'image_id': image_meta['id'],
+                'owner_id': image_meta['owner'],
+                'receiver_tenant_id': context.tenant,
+                'receiver_user_id': context.user,
+                'destination_ip': request.remote_addr,
+            }
+            if bytes_written != expected_size:
+                self.notifier.error('image.send', payload)
+            else:
+                self.notifier.info('image.send', payload)
+        except Exception, err:
+            msg = _("An error occurred during image.send"
+                    " notification: %(err)s") % locals()
+            logger.error(msg)
+
     def show(self, response, result):
         image_meta = result['image_meta']
+        image_id = image_meta['id']
 
-        response.app_iter = result['image_iterator']
+        # We use a secondary iterator here to wrap the
+        # iterator coming back from the store driver in
+        # order to check for disconnections from the backend
+        # storage connections and log an error if the size of
+        # the transferred image is not the same as the expected
+        # size of the image file. See LP Bug #882585.
+        def checked_iter(image_id, expected_size, image_iter):
+            bytes_written = 0
+
+            def notify_image_sent_hook(env):
+                self.image_send_notification(bytes_written, expected_size,
+                                             image_meta, response.request)
+
+            # Add hook to process after response is fully sent
+            if 'eventlet.posthooks' in response.environ:
+                response.environ['eventlet.posthooks'].append(
+                    (notify_image_sent_hook, (), {}))
+
+            try:
+                for chunk in image_iter:
+                    yield chunk
+                    bytes_written += len(chunk)
+            except Exception, err:
+                msg = _("An error occurred reading from backend storage "
+                        "for image %(image_id)s: %(err)s") % locals()
+                logger.error(msg)
+                raise
+
+            if expected_size != bytes_written:
+                msg = _("Backend storage for image %(image_id)s "
+                        "disconnected after writing only %(bytes_written)d "
+                        "bytes") % locals()
+                logger.error(msg)
+                raise IOError(errno.EPIPE, _("Corrupt image download for "
+                                             "image %(image_id)s") % locals())
+
+        image_iter = result['image_iterator']
+        # image_meta['size'] is a str
+        expected_size = int(image_meta['size'])
+        response.app_iter = checked_iter(image_id, expected_size, image_iter)
         # Using app_iter blanks content-length, so we set it here...
         response.headers['Content-Length'] = image_meta['size']
         response.headers['Content-Type'] = 'application/octet-stream'
@@ -873,7 +1034,7 @@ class ImageSerializer(wsgi.JSONResponseSerializer):
 
     def create(self, response, result):
         image_meta = result['image_meta']
-        response.status = httplib.CREATED
+        response.status = 201
         response.headers['Content-Type'] = 'application/json'
         response.body = self.to_json(dict(image=image_meta))
         self._inject_location_header(response, image_meta)
@@ -881,8 +1042,8 @@ class ImageSerializer(wsgi.JSONResponseSerializer):
         return response
 
 
-def create_resource(options):
+def create_resource(conf):
     """Images resource factory method"""
     deserializer = ImageDeserializer()
-    serializer = ImageSerializer()
-    return wsgi.Resource(Controller(options), deserializer, serializer)
+    serializer = ImageSerializer(conf)
+    return wsgi.Resource(Controller(conf), deserializer, serializer)
